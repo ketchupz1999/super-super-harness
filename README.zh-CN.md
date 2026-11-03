@@ -1,6 +1,6 @@
 # Super Super Harness
 
-![Super Super Harness](docs/assets/cover.png)
+![架构](docs/assets/architecture.png)
 
 [English](README.md) | 中文
 
@@ -40,8 +40,6 @@
 </table>
 
 ## 架构
-
-![架构](docs/assets/architecture.png)
 
 - **一个入口**：Agent 之间不直连，都经过 Router 和后台服务。
 - **事件一个入口**：所有动静按规则丢弃、记录、转给你或叫醒 Router。

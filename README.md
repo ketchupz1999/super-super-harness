@@ -1,6 +1,6 @@
 # Super Super Harness
 
-![Super Super Harness](docs/assets/cover.png)
+![Architecture](docs/assets/architecture.png)
 
 English | [中文](README.zh-CN.md)
 
@@ -40,8 +40,6 @@ Questions and results come back to you, and you can watch the work as it happens
 </table>
 
 ## Architecture
-
-![Architecture](docs/assets/architecture.png)
 
 - **One entry point**: agents never talk to each other directly; everything goes through the Router and the background service.
 - **One door for events**: every event is dropped, recorded, sent to you or used to wake the Router, by rule.
