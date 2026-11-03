@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+tmp/
+owner-token
+web-session-key
+router.db*
+keys/
+run/
+workspaces/
+service.pid
+service.log
+*.sock

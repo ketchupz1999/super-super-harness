@@ -1,0 +1,21 @@
+# Public defaults only. Run `supersuperharness init` to create your private SSHARNESS_HOME/profiles.toml.
+# Upgrading from repository-local configuration? See docs/setup.md#upgrade-migration BEFORE upgrading.
+default_profile = "default"
+
+[router]
+primary = "default"
+backup = "default" # Add a second Profile to enable a separate fallback model.
+
+[harness.claude-code]
+binary = "claude"
+
+[profiles.default]
+harness = "claude-code"
+provider = "anthropic"
+model = "claude-opus-5-5"
+context_window = 1000000
+
+[web]
+port = 8765
+user_name = "You"
+user_avatar = ""

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+ROOT="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)"
+# -P keeps the current directory off sys.path: a release started inside the repo must not run the working tree.
+PYTHONPATH="$ROOT" exec python3 -P -m super_super_harness.cli "$@"
