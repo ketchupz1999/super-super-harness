@@ -25,7 +25,19 @@ Questions and results come back to you, and you can watch the work as it happens
 | Scheduled tasks | Remind you on time, or wake the Router to do the work |
 | Model failover | Out of quota, switch to a backup model; switch back when it recovers |
 
-> 🖼️ **[Placeholder] Screenshot wall (2 rows × 3)**: Chat with Routing panel · Routing (expanded) · Inspect / Workers · Models · Terminal chat
+<table>
+<tr>
+<td width="50%"><img src="docs/assets/screenshot-chat.png" alt="Chat with the Routing panel"><br><sub>Chat, with the Routing panel beside it</sub></td>
+<td width="50%"><img src="docs/assets/screenshot-inspect.png" alt="Inspect a Worker"><br><sub>Inspect: open any Worker's session</sub></td>
+</tr>
+<tr>
+<td rowspan="2"><img src="docs/assets/screenshot-routing.png" alt="Routing, expanded"><br><sub>Routing: ten Workers in parallel, grouped by item</sub></td>
+<td><img src="docs/assets/screenshot-soul-memory.png" alt="Soul and Memory"><br><sub>Soul & Memory: how the Router works and what it remembers</sub></td>
+</tr>
+<tr>
+<td><img src="docs/assets/screenshot-terminal.png" alt="Terminal chat"><br><sub>The same Router from the terminal</sub></td>
+</tr>
+</table>
 
 ## Architecture
 

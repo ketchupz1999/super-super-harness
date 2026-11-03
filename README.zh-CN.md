@@ -25,7 +25,19 @@
 | 定时任务 | 到点提醒你，或叫醒 Router 去干活 |
 | 模型自动切换 | 额度用完换备用模型，恢复后切回 |
 
-> 🖼️ **[占位] 页面截图墙（两行三列）**：对话与 Routing 面板 · Routing 全屏 · Inspect / Workers · Models · 终端 chat
+<table>
+<tr>
+<td width="50%"><img src="docs/assets/screenshot-chat.png" alt="对话与 Routing 面板"><br><sub>对话，旁边是 Routing 面板</sub></td>
+<td width="50%"><img src="docs/assets/screenshot-inspect.png" alt="Inspect"><br><sub>Inspect：点开任一 Worker 的会话</sub></td>
+</tr>
+<tr>
+<td rowspan="2"><img src="docs/assets/screenshot-routing.png" alt="Routing 全屏"><br><sub>Routing：十个 Worker 并行，按事项分组</sub></td>
+<td><img src="docs/assets/screenshot-soul-memory.png" alt="Soul & Memory"><br><sub>Soul & Memory：Router 的工作方式和它记住的事</sub></td>
+</tr>
+<tr>
+<td><img src="docs/assets/screenshot-terminal.png" alt="终端对话"><br><sub>在终端里和同一个 Router 说话</sub></td>
+</tr>
+</table>
 
 ## 架构
 
