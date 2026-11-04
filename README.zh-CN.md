@@ -65,7 +65,7 @@ bin/supersuperharness web --open   # 另开终端，打开网页
 
 ![我的模型分工](docs/assets/model-routing.png)
 
-更多见 [安装与配置](docs/setup.md)、[使用指南](docs/guide.md)。
+更多见 [安装与配置](docs/setup.md)、[使用指南](docs/guide.md)。常见问题（比如和 Claude Code sub-agents 有什么区别）见 [FAQ](docs/faq.md)（英文）。
 
 > ⚠️ Worker 有完整的本机权限，只在你信任的机器上用。
 

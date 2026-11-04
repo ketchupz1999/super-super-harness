@@ -65,7 +65,7 @@ My own setup: Opus for the Router, Astra for the bulk of the work, a different m
 
 ![My model routing](docs/assets/model-routing-en.png)
 
-More in [Setup](docs/setup.md) and the [Guide](docs/guide.md).
+More in [Setup](docs/setup.md) and the [Guide](docs/guide.md). Common questions, such as how this differs from Claude Code sub-agents, are in the [FAQ](docs/faq.md).
 
 > ⚠️ Workers have full permissions on your machine. Only run it on a machine you trust.
 
