@@ -67,7 +67,12 @@ class History:
         kind, title = row.get("kind") or "answer", ""
         if role == "router":
             kind, title = worker_notice(self.db, kind, row.get("turn_id"), key[1])
-        return Message(role, str(row["text"]), row.get("created") or 0, kind, key, title)
+        text = str(row["text"])
+        if role == "user" and self.query("SELECT name FROM sqlite_master WHERE type='table' AND name='message_attachments'"):
+            images = self.query("SELECT a.id,a.filename FROM attachments a JOIN message_attachments m ON a.id=m.attachment_id "
+                                "WHERE m.message_id=? ORDER BY m.position", (key[1],))
+            text = "\n".join([text] + ["[图片 %s %s]" % (a["id"], a["filename"]) for a in images]).strip()
+        return Message(role, text, row.get("created") or 0, kind, key, title)
 
     def recent(self, limit=8):
         columns = {r["name"] for r in self.query("PRAGMA table_info(conversation)")}

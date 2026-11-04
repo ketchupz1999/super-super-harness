@@ -6,12 +6,14 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from super_super_harness import cli
-from super_super_harness.adapters import hermes
+from super_super_harness.adapters import hermes, procs
+from super_super_harness.daemon import Service
 from super_super_harness.ops import config, setup
 from tests.support import ServiceCase
 from tests.test_hermes import configuration
@@ -28,13 +30,48 @@ class HermesIntegrationTests(ServiceCase):
         raw["providers"]["two"]["base_url"] = "http://127.0.0.1:%d" % self.backup.port
         (self.home / "profiles.toml").write_text(setup.toml_text(raw))
         self.cfg = config.load(self.home)
-        await super().boot()
-        await self.until(lambda: self.service.router.ready)
-        self.service.tasks.caller_wait = .1
+        self.service = Service(self.cfg)
+        self.cleanups, self.cleanup_errors = {}, []
+        end_process = self.service.tasks._end_process
+        def tracked_end(task_id):
+            finish = end_process(task_id)   # preserve synchronous run.ending/slot changes
+            done = asyncio.Event()
+            self.cleanups.setdefault(task_id, []).append(done)
+            async def tracked():
+                try:
+                    await finish
+                except BaseException as exc:
+                    self.cleanup_errors.append(type(exc).__name__)
+                    raise
+                finally:
+                    done.set()
+            return tracked()
+        self.service.tasks._end_process = tracked_end
+        self.running = asyncio.create_task(self.service.run())
+        await self.until(lambda: self.cfg.sock.exists() and self.service.router.ready)
+
+    async def halt(self):
+        await super().halt()
+        await self.until(lambda: all(done.is_set() for group in self.cleanups.values() for done in group),
+                         label="Hermes cleanup after service shutdown")
+        self.assertEqual(self.cleanup_errors, [])
+
+    def diagnostics(self, task_id):
+        return json.dumps({"events": [dict(row) for row in self.store.all(
+            "SELECT type,data FROM events WHERE task_id=? AND type IN ('report.done','report.unconfirmed','worker.retry','task.failed') ORDER BY id", task_id)],
+            "runs": [dict(row) for row in self.store.all("SELECT pid,ended,exit_code FROM worker_runs WHERE task_id=? ORDER BY id", task_id)]}, ensure_ascii=False)
 
     async def finished(self, task_id, status="completed"):
-        await self.until(lambda: self.status(task_id) == status and task_id not in self.service.tasks.live,
-                         label="Hermes Worker " + status)
+        try:
+            await self.until(lambda: self.status(task_id) == status and task_id not in self.service.tasks.live,
+                             label="Hermes Worker " + status)
+            # Removal from live precedes the old workspace sweep. Do not launch a
+            # new process in that workspace until the original cleanup is done.
+            await self.until(lambda: all(done.is_set() for done in self.cleanups.get(task_id, [])),
+                             label="Hermes Worker cleanup")
+        except AssertionError:
+            self.fail("Hermes Worker did not settle: " + self.diagnostics(task_id))
+        self.assertEqual(self.cleanup_errors, [])
 
     async def test_router_worker_interrupt_resume_cli_web_and_probe_paths(self):
         self.say("hello")
@@ -55,7 +92,7 @@ class HermesIntegrationTests(ServiceCase):
         self.service.tasks.resume(waiting, "REPORT2")
         await self.finished(waiting)
         self.assertEqual(self.store.task(waiting)["session_id"], sid)
-        self.assertEqual(self.store.task(waiting)["report"], "fixture report two")
+        self.assertEqual(self.store.task(waiting)["report"], "fixture report two", self.diagnostics(waiting))
         wire = self.home / "hermes" / "homes" / sid / "wire.jsonl"
         frames = [json.loads(line) for line in wire.read_text().splitlines()]
         self.assertTrue(any(f.get("method") == "session/load" for f in frames))
@@ -81,6 +118,89 @@ class HermesIntegrationTests(ServiceCase):
         self.assertIn("REPORT", output.getvalue())
         with self.assertRaisesRegex(ValueError, "fork/peek"):
             cli.exec_interactive(self.cfg, "work", task["session_id"], task["cwd"], None, None, fork=True)
+
+    async def test_immediate_resume_waits_for_old_workspace_sweep(self):
+        tasks = self.service.tasks
+        self.cfg.limits["worker_retries"] = 0
+        task_id = self.start_task("WAIT")
+        sid = self.store.task(task_id)["session_id"]
+        await self.until(lambda: hermes.session_has(self.cfg, sid, "WAIT"))
+        old = tasks.live[task_id]
+        root = self.store.task(task_id)["workspace"]
+        entered, release, swept = threading.Event(), threading.Event(), threading.Event()
+        sweep = procs.sweep
+        killed = []
+        def paused_sweep(path):
+            if path == root and not entered.is_set():
+                entered.set()
+                if not release.wait(10):
+                    raise RuntimeError("fixture sweep barrier timed out")
+                try:
+                    killed.extend(sweep(path))
+                    return killed
+                finally:
+                    swept.set()
+            return sweep(path)
+        with patch.object(procs, "sweep", side_effect=paused_sweep):
+            try:
+                self.assertTrue(tasks.interrupt(task_id)["ok"])
+                # Deliberately do not use finished(): it hides this production race.
+                await self.until(lambda: self.status(task_id) == "interrupted" and task_id not in tasks.live)
+                await self.until(entered.is_set, label="old sweep entered")
+                self.assertTrue(tasks.resume(task_id, "WAIT resumed-unique")["ok"])
+                tasks.schedule()
+                self.assertNotIn(task_id, tasks.live, "resume must wait for the old workspace sweep")
+                self.assertEqual(self.status(task_id), "queued")
+                self.assertEqual(self.store.one("SELECT COUNT(*) n FROM worker_runs WHERE task_id=?", task_id)["n"], 1)
+            finally:
+                release.set()
+                await self.until(swept.is_set, label="old sweep finished")
+            await self.until(lambda: hermes.session_has(self.cfg, sid, "WAIT resumed-unique"))
+            new = tasks.live[task_id]
+            self.assertIsNot(new, old)
+            self.assertNotIn(new.process.proc.pid, killed)
+            self.assertIsNone(new.process.proc.returncode)
+            await tasks.stop(task_id)
+            await self.finished(task_id, "stopped")
+        self.assertIsNone(self.store.one("SELECT 1 FROM events WHERE task_id=? AND type='worker.retry'", task_id))
+
+    async def test_finished_waits_for_the_original_workspace_sweep(self):
+        entered, release = threading.Event(), threading.Event()
+        sweep = procs.sweep
+        def paused_sweep(path, *args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("fixture sweep barrier timed out")
+            return sweep(path, *args, **kwargs)
+        with patch.object(procs, "sweep", side_effect=paused_sweep):
+            task_id = self.start_task("REPORT")
+            try:
+                await self.until(entered.is_set)
+                waiter = asyncio.create_task(self.finished(task_id))
+                await asyncio.sleep(.05)
+                self.assertFalse(waiter.done(), "live removal must not stand in for complete cleanup")
+                release.set()
+                await waiter
+            finally:
+                release.set()
+        self.service.tasks.send(task_id, "REPORT2")
+        await self.finished(task_id)
+        self.assertEqual(self.store.task(task_id)["report"], "fixture report two", self.diagnostics(task_id))
+        self.assertIsNone(self.store.one("SELECT id FROM events WHERE task_id=? AND type='worker.retry'", task_id))
+
+    async def test_parent_report_tolerates_delayed_stream_attribution(self):
+        on_event = self.service.tasks._on_event
+        async def delayed_event(task_id, run, message):
+            blocks = (message.get("message") or {}).get("content", [])
+            if message.get("type") == "assistant" and any(
+                    b.get("type") == "tool_use" and b.get("name") == "mcp__router__report_done" for b in blocks):
+                await asyncio.sleep(.6)
+            await on_event(task_id, run, message)
+        with patch.object(self.service.tasks, "_on_event", side_effect=delayed_event):
+            task_id = self.start_task("REPORT2")
+            await self.finished(task_id)
+        self.assertEqual(self.store.task(task_id)["report"], "fixture report two", self.diagnostics(task_id))
+        self.assertIsNone(self.store.one("SELECT id FROM events WHERE task_id=? AND type='report.unconfirmed'", task_id))
 
     async def test_late_receipts_keep_reports_bound_to_their_own_assignments(self):
         task_id = self.start_task("REPORT PAUSE")
@@ -186,8 +306,9 @@ class HermesIntegrationTests(ServiceCase):
                     self.assertEqual(db.execute("SELECT COUNT(*) FROM messages WHERE role='user'").fetchone()[0], 1)
 
     async def test_unattributed_child_report_is_progress_not_final_report(self):
-        task_id = self.start_task("CHILD_REPORT")
-        await self.finished(task_id)
+        with patch.object(self.service.tasks, "caller_wait", .1):
+            task_id = self.start_task("CHILD_REPORT")
+            await self.finished(task_id)
         self.assertEqual(self.store.task(task_id)["report"], "fake answer")
         self.assertIsNotNone(self.store.one("SELECT id FROM events WHERE task_id=? AND type='report.unconfirmed'", task_id))
         self.assertIsNone(self.store.one("SELECT id FROM events WHERE task_id=? AND type='report.done'", task_id))

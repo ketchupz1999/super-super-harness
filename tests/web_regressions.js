@@ -2,6 +2,7 @@
 // Actual layout and scroll anchoring are also checked in a disposable browser instance.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const {File} = require('node:buffer');
 const vm = require('node:vm');
 const html = fs.readFileSync(process.argv[2], 'utf8');
 const elements = new Map(), listeners = {}, timers = new Map();
@@ -43,6 +44,8 @@ class Element {
   contains() { return false; }
   querySelectorAll() { return []; }
   closest(selector) { return selector==='#view-tasks'?tasksPage:null; }
+  addEventListener(name,fn) { (this.events ||= {})[name]=fn; }
+  click() { return this.onclick?.(); }
   focus() { document.activeElement=this; }
   scrollIntoView() { this.scrolled=true; }
   getBoundingClientRect() { return {top:0,bottom:this.id==='thread'?10000:(this.clientHeight || 0)}; }
@@ -74,8 +77,159 @@ const script = html.match(/<script>([\s\S]*?)<\/script>/)[1].split("$('send').on
 vm.runInContext(script,context);
 const run = code => vm.runInContext(code,context);
 run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Review '+i,next_time:'Tomorrow',kind:'notify'}))};`);
+// Image tests exercise the shipped handlers and fetch path, not a parallel implementation.
+const imageFile=(name='screen.png',type='image/png',size=4)=>new File([new Uint8Array(size)],name,{type});
+const imageMetadata=(file,id='image-1')=>({id,filename:file.name,mime:file.type,size:file.size,sha256:'a'.repeat(64)});
+const flushImages=async()=>{for(let i=0;i<60;i++) await Promise.resolve();};
+function imageHarness() {
+  const created=[], revoked=[], requests=[], pageEvents={}; let sequence=0;
+  context.URL={createObjectURL(file){const url='blob:test-'+(created.length+1);created.push({file,url});return url;},revokeObjectURL(url){revoked.push(url);}};
+  context.crypto={randomUUID:()=> 'message-'+(++sequence)};
+  context.window={addEventListener:(name,fn)=>pageEvents[name]=fn};
+  context.fetch=async(path,options)=>{
+    requests.push({path,options});const id='image-'+requests.length;
+    return {ok:true,json:async()=>path.startsWith('/api/attachments?')?imageMetadata(options.body,id):{ok:true}};
+  };
+  run(`$('input').value='';sync=async()=>{};bindComposerImages();`);
+  const add=files=>{context.imageTestFiles=files;run('addImages(imageTestFiles);');};
+  return {created,revoked,requests,pageEvents,add};
+}
 (async()=>{
   switch(process.argv[3]) {
+    case 'b26-image-inputs': {
+      const h=imageHarness(), file=imageFile('screen & <one>.png');
+      assert.match(html,/<input id="imageFiles"[^>]*accept="image\/png,image\/jpeg,image\/gif,image\/webp"[^>]*multiple hidden>/);
+      let picked=0;elements.get('imageFiles').click=()=>picked++;elements.get('chooseImages').onclick();assert.equal(picked,1);
+      elements.get('imageFiles').files=[file,imageFile('second.jpg','image/jpeg')];elements.get('imageFiles').value='selected';elements.get('imageFiles').onchange();
+      assert.equal(elements.get('imageFiles').value,'','Same file can be selected again');
+      let prevented=0;
+      const paste=elements.get('input').events.paste;
+      paste({clipboardData:{files:[],items:[],getData:()=> 'ordinary text'},preventDefault(){prevented++;}});
+      assert.equal(prevented,0);assert.equal(run('draftImages.size'),2);
+      paste({clipboardData:{files:[imageFile('paste.gif','image/gif')],getData:()=>''},preventDefault(){prevented++;}});
+      assert.equal(prevented,1);
+      paste({clipboardData:{files:[],items:[{kind:'file',getAsFile:()=>imageFile('mixed.webp','image/webp')}],getData:()=> 'keep this text'},preventDefault(){prevented++;}});
+      assert.equal(prevented,1,'Mixed paste preserves native text insertion');
+      const box=elements.get('composerBox'), transfer={types:['Files'],files:[imageFile('drop.png')]};
+      box.events.dragover({dataTransfer:transfer,preventDefault(){prevented++;}});assert.ok(box.classList.contains('drag-over'));assert.equal(transfer.dropEffect,'copy');
+      box.events.dragleave({relatedTarget:null});assert.ok(!box.classList.contains('drag-over'));
+      box.events.drop({dataTransfer:transfer,preventDefault(){prevented++;}});assert.ok(!box.classList.contains('drag-over'));
+      box.events.drop({dataTransfer:{files:[]},preventDefault(){throw Error('Text drag should remain native');}});
+      await flushImages();assert.equal(run('draftImages.size'),5);assert.equal(h.requests.length,5);
+      assert.equal(h.requests[0].path,'/api/attachments?filename='+encodeURIComponent(file.name));
+      assert.equal(h.requests[0].options.body,file,'Raw File body, not JSON or multipart');assert.equal(h.requests[0].options.method,'POST');assert.equal(h.requests[0].options.headers['Content-Type'],'image/png');
+      assert.match(elements.get('draftImages').innerHTML,/blob:test-1/);assert.match(elements.get('draftImages').innerHTML,/screen &amp; &lt;one&gt;\.png/);assert.doesNotMatch(elements.get('draftImages').innerHTML,/<one>/);
+      assert.equal(elements.get('send').disabled,false);
+      break;
+    }
+    case 'b26-image-limits': {
+      const h=imageHarness();assert.deepEqual(JSON.parse(run('JSON.stringify(imageLimits())')),{max_bytes:10485760,max_count:6});
+      run('data.image_limits={max_bytes:4,max_count:2};');
+      h.add([imageFile('fake.png','image/svg+xml'),imageFile('empty.png','image/png',0),imageFile('big.png','image/png',5),imageFile('one.png'),imageFile('two.png'),imageFile('three.png')]);
+      await flushImages();assert.equal(h.requests.length,2);assert.equal(h.created.length,2);assert.equal(run('draftImages.size'),2);
+      const notice=elements.get('imageNotice').textContent;assert.match(notice,/Only PNG, JPEG, GIF and WebP/);assert.match(notice,/empty.png/);assert.match(notice,/big.png/);assert.match(notice,/at most 2 images/);
+      assert.ok(h.requests.every(r=>r.options.body.size===4),'Exact size boundary is accepted');
+      run(`data.image_limits.max_count=1;$('input').value='Keep text';`);await run('send()');assert.equal(h.requests.length,2);assert.equal(elements.get('input').value,'Keep text');
+      await listeners.click({target:{closest:()=>({dataset:{imageRemove:'2'}})}});assert.equal(h.revoked.length,1);
+      run('data.image_limits.max_bytes=3;');await run('send()');assert.equal(h.requests.length,2,'Changed server limits are enforced again before sending');
+      run('data.image_limits.max_bytes=4;');await run('send()');assert.equal(h.requests.length,3);assert.equal(run('draftImages.size'),0);
+      assert.equal(new Set(h.revoked).size,2);
+      break;
+    }
+    case 'b26-image-upload-retry': {
+      const h=imageHarness(), file=imageFile();let attempt=0;
+      context.fetch=async(path,options)=>{h.requests.push({path,options});attempt++;return attempt<3?{ok:false,status:attempt===1?415:429,json:async()=>({error:attempt===1?'Invalid image header <unsafe>':'Another upload is active'})}:{ok:true,json:async()=>imageMetadata(file)};};
+      h.add([file]);await flushImages();
+      assert.equal(run('draftImages.get("1").file'),file);assert.equal(run('draftImages.get("1").metadata'),null);assert.equal(elements.get('send').disabled,true);
+      assert.match(elements.get('draftImages').innerHTML,/Upload failed: Invalid image header &lt;unsafe&gt;/);assert.match(elements.get('draftImages').innerHTML,/data-image-retry="1"/);
+      run(`$('input').value='Do not lose me';`);await run('send()');assert.equal(h.requests.length,1);assert.equal(elements.get('input').value,'Do not lose me');
+      await listeners.click({target:{closest:()=>({dataset:{imageRetry:'1'}})}});
+      assert.equal(h.requests.length,2);assert.equal(h.requests[1].options.body,file);assert.match(elements.get('draftImages').innerHTML,/Another upload is active/);assert.equal(elements.get('send').disabled,true,'HTTP 429 keeps the draft retryable');
+      await listeners.click({target:{closest:()=>({dataset:{imageRetry:'1'}})}});
+      assert.equal(h.requests.length,3);assert.equal(h.requests[2].options.body,file);assert.equal(h.created.length,1);assert.equal(h.revoked.length,0);assert.equal(elements.get('send').disabled,false);
+      assert.equal(run('draftImages.get("1").metadata.id'),'image-1');
+      await listeners.click({target:{closest:()=>({dataset:{imageRemove:'1'}})}});assert.deepEqual(h.revoked,['blob:test-1']);
+      break;
+    }
+    case 'b26-image-send-retry': {
+      const h=imageHarness();h.add([imageFile('one.png'),imageFile('two.jpg','image/jpeg')]);await flushImages();
+      const posts=[];let release;
+      context.fetch=async(path,options)=>{posts.push({path,body:options.body});if(posts.length===1) throw Error('Lost acknowledgement');return new Promise(resolve=>{release=resolve;});};
+      // Image-only messages are valid, and the failed pending row keeps both images.
+      assert.equal(await run('send()'),false);assert.equal(run('draftImages.size'),0);assert.equal(h.revoked.length,2);
+      assert.match(elements.get('thread').innerHTML,/Send failed: Lost acknowledgement/);assert.match(elements.get('thread').innerHTML,/\/api\/attachments\/image-1/);assert.match(elements.get('thread').innerHTML,/\/api\/attachments\/image-2/);
+      assert.deepEqual(JSON.parse(posts[0].body),{text:'',request_id:'message-1',attachments:['image-1','image-2']});
+      run(`$('input').value='Next draft';data.image_limits={max_count:1,max_bytes:1};`);
+      const retry=run(`send('message-1')`);await flushImages();await run(`send('message-1')`);assert.equal(posts.length,2,'Double retry cannot send twice concurrently');
+      assert.equal(posts[1].body,posts[0].body,'Retry preserves exact serialized payload despite edited draft and changed limits');
+      release({ok:true,json:async()=>({ok:true})});assert.equal(await retry,true);assert.equal(run('pending.size'),0);assert.equal(elements.get('input').value,'Next draft');
+      const textOnly=run('send()');assert.deepEqual(JSON.parse(posts[2].body),{text:'Next draft',request_id:'message-2',attachments:[]});
+      release({ok:true,json:async()=>({ok:true})});assert.equal(await textOnly,true);assert.equal(elements.get('input').value,'');
+      await run('send()');assert.equal(posts.length,3,'An empty composer still sends nothing');
+      break;
+    }
+    case 'b26-image-races': {
+      const h=imageHarness(), requests=[];
+      context.fetch=(path,options)=>new Promise(resolve=>requests.push({path,options,resolve}));
+      h.add([imageFile('removed.png'),imageFile('queued.png'),imageFile('kept.png')]);await flushImages();
+      run(`$('input').value='First';`);await run('send()');assert.equal(run('pending.size'),0);assert.equal(requests.length,1,'Uploads are sequential and Send cannot silently omit queued images');
+      assert.match(elements.get('draftImages').innerHTML,/Waiting to upload/);
+      run(`uploadImage('3');removeDraftImage('1');removeDraftImage('2');`);await flushImages();assert.equal(requests.length,1,'Removing an active upload does not release its slot early');
+      requests[0].resolve({ok:true,json:async()=>imageMetadata(requests[0].options.body,'removed')});await flushImages();assert.equal(run('draftImages.size'),1);assert.equal(requests.length,2);
+      assert.equal(requests[1].options.body.name,'kept.png','Removed queued image never reaches the API');
+      requests[1].resolve({ok:true,json:async()=>imageMetadata(requests[1].options.body,'kept')});await flushImages();
+      const sending=run('send()');assert.equal(requests.length,3);
+      assert.deepEqual(JSON.parse(requests[2].options.body),{text:'First',request_id:'message-1',attachments:['kept']});
+      h.add([imageFile('next.png')]);run(`$('input').value='Next';`);await flushImages();
+      requests[3].resolve({ok:true,json:async()=>imageMetadata(requests[3].options.body,'next')});await flushImages();
+      requests[2].resolve({ok:true,json:async()=>({ok:true})});await sending;
+      assert.equal(run('draftImages.size'),1);assert.equal(run('[...draftImages.values()][0].metadata.id'),'next');assert.equal(elements.get('input').value,'Next');
+      assert.deepEqual(h.revoked,['blob:test-1','blob:test-2','blob:test-3']);
+      const second=run('send()');assert.deepEqual(JSON.parse(requests[4].options.body),{text:'Next',request_id:'message-2',attachments:['next']});
+      requests[4].resolve({ok:true,json:async()=>({ok:true})});await second;assert.equal(h.revoked.length,4);
+      break;
+    }
+    case 'b26-image-rendering': {
+      const attachment={id:'image?x="<bad>/#',filename:'<img src=x onerror="bad">.png',mime:'image/png',size:4,sha256:'hash'};
+      context.imageAttachment=attachment;
+      run(`messages=new Map([[1,{id:1,role:'user',text:'',status:'done',attachments:[imageAttachment]}]]);renderThread(true);`);
+      let markup=elements.get('thread').innerHTML;
+      assert.match(markup,/target="_blank" rel="noopener noreferrer"/);assert.ok(markup.includes('/api/attachments/'+encodeURIComponent(attachment.id)));assert.match(markup,/&lt;img src=x onerror=&quot;bad&quot;&gt;\.png/);assert.doesNotMatch(markup,/<bad>|<img src=x/);
+      assert.match(markup,/loading="lazy" width="96" height="80"/,'Reserve thumbnail geometry to avoid image-load scroll jumps');
+      run(`messages.get(1).attachments=[{id:'new',filename:'new.webp',mime:'image/webp'}];renderThread();`);markup=elements.get('thread').innerHTML;assert.match(markup,/\/api\/attachments\/new/);assert.doesNotMatch(markup,/image%3F/,'Attachments participate in thread reconciliation');
+      assert.equal(run(`messageImages([{id:'x',filename:'x.svg',mime:'image/svg+xml'},null])`),'');
+      run(`messages.get(1).attachments=[];renderThread();`);assert.doesNotMatch(elements.get('thread').innerHTML,/class="image-list"/);
+      break;
+    }
+    case 'b26-image-auth-lifecycle': {
+      const h=imageHarness();
+      context.fetch=async()=>({status:401,ok:false,json:async()=>{throw Error('Never read login body');}});
+      h.add([imageFile()]);await flushImages();assert.equal(run('authRequired'),true);assert.equal(run('draftImages.size'),1);assert.match(elements.get('imageNotice').textContent,/Retry or remove/);assert.match(elements.get('error').textContent,/login expired/);
+      run(`authRequired=false;`);
+      context.fetch=(path,options)=>new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>reject(Object.assign(Error('timeout'),{name:'AbortError'}))));
+      const retry=run(`uploadImage('1')`);await flushImages();const timeout=[...timers.values()].find(t=>t.delay===60000);assert.ok(timeout);timeout.fn();await retry;
+      assert.match(elements.get('draftImages').innerHTML,/Upload timed out/);assert.equal(h.revoked.length,0,'Failed uploads keep their local preview for retry');
+      h.pageEvents.pagehide({persisted:true});assert.equal(h.revoked.length,0,'Back-forward cache keeps the live draft');
+      h.pageEvents.pagehide({persisted:false});assert.deepEqual(h.revoked,['blob:test-1']);assert.equal(run('draftImages.size'),0);
+      break;
+    }
+    case 'observations': {
+      run(`observations=[{created:1,source:'github',status:'noted',text:'<script>event</script>',url:'https://github.com/org/repo/pull/1',would_do:'Read <unsafe>',route:'<worker>',used_builtin_tools:true,builtin_tools:['Bash','NotebookEdit','Read','Agent','Task','Skill','terminal','mcp__other__read','<unknown>'],mixed_turn:true},{created:2,source:'github',status:'limited',text:'surplus',url:'javascript:alert(1)',would_do:'',route:'',used_builtin_tools:false,builtin_tools:[],mixed_turn:false}];`);
+      const markup=run('observationList()');
+      assert.match(markup,/&lt;script&gt;event/); assert.doesNotMatch(markup,/<script>|<unsafe>|<worker>|<unknown>|javascript:/);
+      assert.match(markup,/https:\/\/github.com\/org\/repo\/pull\/1/); assert.match(markup,/Not observed \(hourly limit\)/);
+      assert.match(markup,/used_builtin_tools: Bash, NotebookEdit, Read, Agent, Task, Skill, terminal, mcp__other__read, &lt;unknown&gt;/);
+      assert.match(markup,/rel="noopener noreferrer"/);
+      assert.equal((markup.match(/mixed_turn: true/g) || []).length,1);
+      assert.match(markup,/tool use is not automatically a violation/);
+      assert.match(markup,/Every reported tool name except known service Router MCP tools is audited/);
+      run(`observations[0].mixed_turn=false;`);
+      assert.doesNotMatch(run('observationList()'),/mixed_turn:/);
+      run(`observations[0].mixed_turn=true; observations[0].used_builtin_tools=false;`);
+      assert.match(run('observationList()'),/mixed_turn: true/);
+      assert.doesNotMatch(run('observationList()'),/used_builtin_tools:/);
+      break;
+    }
     case 'routing-layout': {
       run(`data.items=[{code:'one',name:'Web <tag>'},{code:'two',name:'Research'}];data.tasks=Array.from({length:6},(_,i)=>({id:'t'+(i+1),code_name:'Name '+i,name:'Task <tag>',item:i<3?'one':'two',model:'gpt-6-astra',status:i===5?'waiting_deps':'running',wait_for:i===5?[{task_id:'t2',satisfied:false}]:[]}));renderCommunication();`);
       for(const panel of [true,false]) {

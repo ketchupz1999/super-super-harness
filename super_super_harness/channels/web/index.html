@@ -174,6 +174,18 @@
   .composer { padding:12px 32px 24px; flex:none; }
   .box { max-width: 1000px; margin: 0 auto; background: var(--surface); border: .5px solid var(--line-strong); border-radius: 10px; padding: 12px 12px 9px 16px; box-shadow: var(--shadow); }
   .box:focus-within { border-color: var(--label-3); }
+  #composerBox.drag-over { border-color:var(--primary); }
+  .image-list { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0; }
+  .image-list:empty { display:none; }
+  .image-list img { display:block; width:96px; height:80px; object-fit:contain; border-radius:6px; background:var(--surface-2); }
+  .image-list a { display:block; max-width:100%; }
+  .draft-image { width:120px; padding:6px; border:1px solid var(--line); border-radius:8px; }
+  .draft-image img { width:106px; }
+  .draft-image small { display:block; overflow-wrap:anywhere; margin:4px 0; }
+  .draft-image .btn { height:24px; padding:0 6px; }
+  .image-notice { color:var(--label-2); font-size:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .composer-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .send:disabled { opacity:.5; cursor:default; }
   textarea { display: block; width: 100%; resize: none; border: 0; outline: 0; background: transparent; }
   textarea::placeholder, input::placeholder { color: var(--caption); }
   .box-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 4px; color: var(--caption); font-size: 12px; }
@@ -744,9 +756,12 @@
           <div id="confirmations" aria-label="Worker questions"></div>
           <div id="progressSummary" aria-label="Worker progress"></div>
         </div></div>
-        <div class="composer"><div class="box">
+        <div class="composer"><div class="box" id="composerBox">
           <textarea id="input" rows="2" aria-label="Message Router" placeholder="Message Router, or add context to an answer…"></textarea>
-          <div class="box-foot"><span>Enter to send · Shift+Enter for a new line</span><button class="send" id="send" title="Send"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
+          <div id="draftImages" class="image-list" aria-label="Images to send"></div>
+          <div id="imageNotice" class="image-notice" role="status" aria-live="polite"></div>
+          <input id="imageFiles" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+          <div class="box-foot"><div class="composer-actions"><button class="btn" id="chooseImages" type="button">Add images</button><span>Enter to send · Shift+Enter for a new line</span></div><button class="send" id="send" title="Send"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
         </div></div>
       </div>
       <aside id="chatRouting" class="chat-side is-idle" aria-label="Routing">
@@ -1614,11 +1629,11 @@ function error(message) {
   if(authRequired) message=loginMessage;
   $('error').textContent=message; $('error').hidden=!message;
 }
-async function api(path, body) {
-  const controller=new AbortController(), timeout=setTimeout(()=>controller.abort(),8000);
+async function api(path, body, raw=false) {
+  const controller=new AbortController(), timeout=setTimeout(()=>controller.abort(),raw?60000:8000);
   try {
     const response=await fetch('/api/'+path, {signal:controller.signal, ...(body===undefined?{cache:'no-store'}:{
-      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+      method:'POST', headers:{'Content-Type':raw?body.type:'application/json'}, body:raw?body:JSON.stringify(body)
     })});
     if(response.status===401) {
       authRequired=true; source?.close(); connected=false; clearTraffic(true); renderHeader(); error(loginMessage);
@@ -1852,10 +1867,10 @@ function renderThread(force=false) {
     const calls=(m.steps || []).filter(s=>!s.hidden).map(routerToolSentence).filter(Boolean);
     const steps = m.role==='router' && calls.length ? `<button class="steps-toggle" data-steps="${m.id}">${calls.length}${m.steps_truncated?'+':''} actions ▸</button>${state.open.has(m.id) ? `<div class="steps">${calls.map(esc).join('<br>')}</div>` : ''}` : '';
     const cards=m.role==='router' ? (m.reminders || []).map(r=>`<div class="reminder-card"><small>Added a reminder · ${esc(r.kind)}</small><span>⏰ ${esc(r.next_time)} · ${esc(r.text)}</span>${r.cron?`<small>Repeats · ${esc(r.cron)}</small>`:''}</div>`).join('') : '';
-    if(m.role==='router' && m.kind==='question' && data.router.question?.id===m.id) return ['message:'+m.id, `<article class="confirmation router-question" id="router-question-${esc(m.id)}" tabindex="-1"><div class="confirmation-head">${dot('waiting')}Router · Needs you · ${esc(stamp(m.created))}</div><div class="message-text markdown">${markdown(m.text)}</div><div class="confirmation-task">${chips?'Linked Workers: ':'Context: this conversation (no Worker)'}${chips}</div><p class="confirmation-context">Reply in the box below; it goes to this conversation.</p><div class="confirmation-actions">${questionOptions(data.router.question,'router')}<button class="btn primary" data-router-reply="${esc(m.id)}">Answer below</button></div>${cards}${steps}</article>`];
-    return ['message:'+m.id, `<div ${m.kind==='question'?`id="router-question-${esc(m.id)}" tabindex="-1"`: ''} class="msg ${reminder?'reminder':mine?'mine':''}">${mine?avatar():m.role==='router' && !reminder?'<span class="avatar router-mini" aria-hidden="true"></span>':''}<div class="msg-body"><div class="msg-meta"><b>${reminder?(m.kind==='reminder.run'?'Scheduled run':'Reminder'):mine?esc(data.user.name):esc(m.title || 'Router')}</b><i>${mine || m.kind==='reminder.run'?'to Router':'to '+esc(data.user.name)} · ${esc(m.channel)} · ${esc(stamp(m.created))}${mine && m.status !== 'done'?' · '+esc(m.status):''}</i></div><div class="bubble"><div class="message-text ${m.role==='router'?'markdown':''}">${m.role==='router'?markdown(m.text):esc(m.text)}</div>${chips?`<div class="chips">${chips}</div>`:''}${cards}${steps}</div></div></div>`];
+    if(m.role==='router' && m.kind==='question' && data.router.question?.id===m.id) return ['message:'+m.id, `<article class="confirmation router-question" id="router-question-${esc(m.id)}" tabindex="-1"><div class="confirmation-head">${dot('waiting')}Router · Needs you · ${esc(stamp(m.created))}</div><div class="message-text markdown">${markdown(m.text)}</div>${messageImages(m.attachments)}<div class="confirmation-task">${chips?'Linked Workers: ':'Context: this conversation (no Worker)'}${chips}</div><p class="confirmation-context">Reply in the box below; it goes to this conversation.</p><div class="confirmation-actions">${questionOptions(data.router.question,'router')}<button class="btn primary" data-router-reply="${esc(m.id)}">Answer below</button></div>${cards}${steps}</article>`];
+    return ['message:'+m.id, `<div ${m.kind==='question'?`id="router-question-${esc(m.id)}" tabindex="-1"`: ''} class="msg ${reminder?'reminder':mine?'mine':''}">${mine?avatar():m.role==='router' && !reminder?'<span class="avatar router-mini" aria-hidden="true"></span>':''}<div class="msg-body"><div class="msg-meta"><b>${reminder?(m.kind==='reminder.run'?'Scheduled run':'Reminder'):mine?esc(data.user.name):esc(m.title || 'Router')}</b><i>${mine || m.kind==='reminder.run'?'to Router':'to '+esc(data.user.name)} · ${esc(m.channel)} · ${esc(stamp(m.created))}${mine && m.status !== 'done'?' · '+esc(m.status):''}</i></div><div class="bubble"><div class="message-text ${m.role==='router'?'markdown':''}">${m.role==='router'?markdown(m.text):esc(m.text)}</div>${messageImages(m.attachments)}${chips?`<div class="chips">${chips}</div>`:''}${cards}${steps}</div></div></div>`];
   });
-  const outgoing = [...pending].map(([key,m]) => ['pending:'+key, `<div class="msg mine">${avatar()}<div class="msg-body"><div class="bubble">${esc(m.text)}</div><span class="label ${m.failed?'failed':'queued'}">${m.failed?'Send failed: '+esc(m.failed):'Sending…'}</span>${m.failed?`<button class="btn" data-retry="${esc(key)}">Retry</button>`:''}</div></div>`]);
+  const outgoing = [...pending].map(([key,m]) => ['pending:'+key, `<div class="msg mine">${avatar()}<div class="msg-body"><div class="bubble">${esc(m.text)}${messageImages(m.attachments)}</div><span class="label ${m.failed?'failed':'queued'}">${m.failed?'Send failed: '+esc(m.failed):'Sending…'}</span>${m.failed?`<button class="btn" data-retry="${esc(key)}">Retry</button>`:''}</div></div>`]);
   updateThread([
     ['date',`<div class="date">${state.historical?'History':'Conversation'}</div>`],
     ['history',`<div>${hasOlder?'<button class="btn" data-older="1">Earlier messages</button>':''} ${state.historical?'<button class="btn" data-latest="1">Back to latest</button>':''}</div>`],
@@ -1975,17 +1990,28 @@ async function loadUsage() {
   if(usageBusy) return; usageBusy=true;
   try { usage=await api('usage'); renderUsage(); } catch(e) { error(e.message); } finally { usageBusy=false; }
 }
-// The Models page renders only the read-only /api/models fields.
+let observations = [];
+function observationList() {
+  const rows=observations.map(o=>{
+    const status={limited:'Not observed (hourly limit)',queued:'No note yet',noted:'Observed'}[o.status] || o.status;
+    const link=/^https?:\/\//i.test(o.url)?`<a href="${esc(o.url)}" target="_blank" rel="noopener noreferrer">${esc(o.url)}</a>`:'';
+    const used=o.used_builtin_tools?`<p>used_builtin_tools: ${esc(o.builtin_tools.join(', '))}</p>`:'';
+    const mixed=o.mixed_turn?'<p>mixed_turn: true (shared with ordinary input; tool use is not automatically a violation)</p>':'';
+    return `<tr><td>${esc(new Date(o.created*1000).toLocaleString())}<br>${esc(o.source)} · ${esc(status)}</td><td>${esc(o.text)}<br>${link}${used}${mixed}</td><td>${esc(o.would_do)}<br>Route: ${esc(o.route)}</td></tr>`;
+  }).join('');
+  return `<h2 class="section">Observations · last 24 hours</h2><p>Hypothetical actions only. Every reported tool name except known service Router MCP tools is audited, not blocked by this audit (including native reads, other MCP services and unknown tools).</p><div class="card"><table><thead><tr><th>Time / status</th><th>Event / link</th><th>Would do / route</th></tr></thead><tbody>${rows}</tbody></table>${rows?'':'<div class="empty">No observations.</div>'}</div>`;
+}
+// The Models page renders read-only model configuration and observation notes.
 function renderModels() {
   if (!models) { $('view-models').innerHTML='<div class="empty">Loading models…</div>'; return; }
   const r=models.router, status=r.switching?['waiting','Switching']:({running:['completed','Running'],paused:['interrupted','Paused'],attached:['interrupted','Attached in a terminal']})[r.mode] || ['queued','Unknown'];
   const role=(title,p,note)=>`<div class="card stat"><small>${title}</small><b title="${esc(p.model)}">${esc(shortModel(p.model))}</b><span>${note}</span></div>`;
   const reach=ok=>`<i class="state ${ok?'completed':'failed'}"></i> ${ok?'Reachable':'Unreachable'}`;
-  $('view-models').innerHTML=`<div class="page-inner"><h1 class="page-title">Models</h1><p class="page-sub">Which models the Router and Workers use. Read-only.</p><h2 class="section">Router</h2><div class="stats">${role('Primary',r.primary,`Profile ${esc(r.primary.profile)}`)}${role('Backup',r.backup,`Profile ${esc(r.backup.profile)}`)}${role('In use',r.current,r.active==='primary'?'Primary':r.active==='backup'?'Backup':`Profile ${esc(r.current.profile)}`)}<div class="card stat"><small>Status</small><b><i class="state ${status[0]}"></i> ${status[1]}</b></div></div><h2 class="section">Worker Profiles</h2><div class="card"><table><thead><tr><th scope="col">Profile</th><th scope="col">Harness</th><th scope="col">Model</th><th scope="col">Provider</th><th scope="col">Default Worker</th><th scope="col">Provider status</th></tr></thead><tbody>${models.profiles.map(p=>`<tr><td class="name">${esc(p.name)}</td><td>${esc(p.harness)}</td><td title="${esc(p.model)}">${esc(shortModel(p.model))}</td><td>${esc(p.provider)}</td><td>${p.default?'Default':''}</td><td>${reach(p.healthy)}</td></tr>`).join('')}</tbody></table>${models.profiles.length?'':'<div class="empty">No profiles configured.</div>'}</div><p class="page-foot">Provider status is a connectivity check, not a model request. · Version ${esc(models.version)}</p></div>`;
+  $('view-models').innerHTML=`<div class="page-inner"><h1 class="page-title">Models</h1><p class="page-sub">Which models the Router and Workers use. Read-only.</p><h2 class="section">Router</h2><div class="stats">${role('Primary',r.primary,`Profile ${esc(r.primary.profile)}`)}${role('Backup',r.backup,`Profile ${esc(r.backup.profile)}`)}${role('In use',r.current,r.active==='primary'?'Primary':r.active==='backup'?'Backup':`Profile ${esc(r.current.profile)}`)}<div class="card stat"><small>Status</small><b><i class="state ${status[0]}"></i> ${status[1]}</b></div></div><h2 class="section">Worker Profiles</h2><div class="card"><table><thead><tr><th scope="col">Profile</th><th scope="col">Harness</th><th scope="col">Model</th><th scope="col">Provider</th><th scope="col">Default Worker</th><th scope="col">Provider status</th></tr></thead><tbody>${models.profiles.map(p=>`<tr><td class="name">${esc(p.name)}</td><td>${esc(p.harness)}</td><td title="${esc(p.model)}">${esc(shortModel(p.model))}</td><td>${esc(p.provider)}</td><td>${p.default?'Default':''}</td><td>${reach(p.healthy)}</td></tr>`).join('')}</tbody></table>${models.profiles.length?'':'<div class="empty">No profiles configured.</div>'}</div><p class="page-foot">Provider status is a connectivity check, not a model request. · Version ${esc(models.version)}</p>${observationList()}</div>`;
 }
 async function loadModels() {
   if(modelsBusy) return; modelsBusy=true;
-  try { models=await api('models'); renderModels(); } catch(e) { error(e.message); } finally { modelsBusy=false; }
+  try { const [modelData,notes]=await Promise.all([api('models'),api('observations')]); models=modelData; observations=notes.observations; renderModels(); } catch(e) { error(e.message); } finally { modelsBusy=false; }
 }
 const kinds = {received:'user',said:'assistant',thinking:'thinking',tool_call:'tool',tool_result:'result',event:'context'};
 const tags = {user:'USER',assistant:'AGENT',thinking:'THINK',tool:'TOOL',result:'RESULT',context:'EVENT',error:'ERROR'};
@@ -2133,16 +2159,117 @@ async function taskAction(id, action, body={}) {
   finally { actionBusy=false; if($('taskSend')) $('taskSend').disabled=false; renderActivity(); renderThread(); }
   return accepted;
 }
+const imageTypes=new Set(['image/png','image/jpeg','image/gif','image/webp']);
+const draftImages=new Map();
+let imageSequence=0, imageNotice='', lastDraftImages='', imageUploadQueue=Promise.resolve();
+function imageLimits() {
+  const limits=data.image_limits || {};
+  return {max_bytes:Number.isInteger(limits.max_bytes) && limits.max_bytes>0?limits.max_bytes:10485760,
+    max_count:Number.isInteger(limits.max_count) && limits.max_count>0?limits.max_count:6};
+}
+function imageDraftProblem() {
+  const limits=imageLimits(), images=[...draftImages.values()];
+  if(images.length>limits.max_count) return `Keep at most ${limits.max_count} images per message.`;
+  if(images.some(item=>item.file.size>limits.max_bytes)) return `Each image must be at most ${limits.max_bytes} bytes.`;
+  if(images.some(item=>item.uploading)) return 'Wait for image uploads to finish before sending.';
+  if(images.some(item=>!item.metadata)) return 'Retry or remove failed images before sending.';
+  return '';
+}
+function renderDraftImages() {
+  const markup=[...draftImages].map(([key,item])=>`<div class="draft-image"><img src="${esc(item.preview)}" alt="${esc(item.file.name)}"><small>${esc(item.file.name)}</small><small>${item.queued?'Waiting to upload…':item.uploading?'Uploading…':item.failed?'Upload failed: '+esc(item.failed):'Ready'}</small>${item.failed?`<button class="btn" id="image-retry-${key}" data-image-retry="${key}">Retry</button> `:''}<button class="btn" id="image-remove-${key}" data-image-remove="${key}" aria-label="${esc('Remove '+item.file.name)}">Remove</button></div>`).join('');
+  if(markup!==lastDraftImages) { lastDraftImages=markup; preserve($('draftImages'),()=>{ $('draftImages').innerHTML=markup; }); }
+  const problem=imageDraftProblem();
+  $('imageNotice').textContent=[imageNotice,problem].filter(Boolean).join('\n');
+  $('send').disabled=Boolean(problem);
+}
+async function uploadImage(key) {
+  const item=draftImages.get(key); if(!item || item.uploading || item.metadata) return;
+  // The backend permits one raw upload at a time. Keep the slot until even a
+  // removed in-flight upload settles; removed queued entries never hit the API.
+  const previous=imageUploadQueue;
+  let release;
+  imageUploadQueue=new Promise(resolve=>{ release=resolve; });
+  item.uploading=true; item.queued=true; item.failed=null; renderDraftImages();
+  try {
+    await previous;
+    if(draftImages.get(key)!==item) return;
+    if(item.file.size>imageLimits().max_bytes) throw new Error(`Image must be at most ${imageLimits().max_bytes} bytes.`);
+    item.queued=false; renderDraftImages();
+    const metadata=await api('attachments?filename='+encodeURIComponent(item.file.name),item.file,true);
+    if(!metadata || typeof metadata.id!=='string' || !metadata.id) throw new Error('Invalid upload response');
+    // Removal must win even if the upload has already reached the server.
+    if(draftImages.get(key)===item) item.metadata=metadata;
+  } catch(e) { if(draftImages.get(key)===item) item.failed=e.name==='AbortError'?'Upload timed out. Try again.':e.message; }
+  finally { item.uploading=false; item.queued=false; release(); renderDraftImages(); }
+}
+function removeDraftImage(key) {
+  const item=draftImages.get(key); if(!item) return;
+  draftImages.delete(key); URL.revokeObjectURL(item.preview); renderDraftImages();
+}
+function addImages(files) {
+  const limits=imageLimits(), rejected=[];
+  for(const file of files) {
+    if(!imageTypes.has(file.type)) { rejected.push(`${file.name}: Only PNG, JPEG, GIF and WebP images are supported.`); continue; }
+    if(file.size<=0 || file.size>limits.max_bytes) { rejected.push(`${file.name}: Image must be nonempty and at most ${limits.max_bytes} bytes.`); continue; }
+    if(draftImages.size>=limits.max_count) { rejected.push(`Keep at most ${limits.max_count} images per message.`); break; }
+    const key=String(++imageSequence);
+    draftImages.set(key,{file,preview:URL.createObjectURL(file),metadata:null,uploading:false,failed:null});
+    uploadImage(key);
+  }
+  imageNotice=rejected.join('\n'); renderDraftImages();
+}
+function bindComposerImages() {
+  $('chooseImages').onclick=()=>$('imageFiles').click();
+  $('imageFiles').onchange=()=>{ addImages(Array.from($('imageFiles').files || [])); $('imageFiles').value=''; };
+  $('input').addEventListener('paste',e=>{
+    const clipboard=e.clipboardData;
+    const files=Array.from(clipboard?.files || []);
+    if(!files.length) for(const item of Array.from(clipboard?.items || [])) {
+      if(item.kind==='file') { const file=item.getAsFile(); if(file) files.push(file); }
+    }
+    // Keep ordinary (and mixed text/image) paste native; consume image-only paste.
+    if(!files.length) return;
+    if(!clipboard.getData('text/plain')) e.preventDefault();
+    addImages(files);
+  });
+  const box=$('composerBox');
+  box.addEventListener('dragover',e=>{
+    if(!Array.from(e.dataTransfer?.types || []).includes('Files')) return;
+    e.preventDefault(); e.dataTransfer.dropEffect='copy'; box.classList.add('drag-over');
+  });
+  box.addEventListener('dragleave',e=>{ if(!box.contains(e.relatedTarget)) box.classList.remove('drag-over'); });
+  box.addEventListener('drop',e=>{
+    box.classList.remove('drag-over');
+    const files=Array.from(e.dataTransfer?.files || []); if(!files.length) return;
+    e.preventDefault(); addImages(files);
+  });
+  window.addEventListener('pagehide',e=>{ if(!e.persisted) for(const key of [...draftImages.keys()]) removeDraftImage(key); });
+}
+function messageImages(attachments) {
+  const images=(attachments || []).filter(a=>a && typeof a.id==='string' && a.id && imageTypes.has(a.mime));
+  if(!images.length) return '';
+  return `<div class="image-list">${images.map(a=>{
+    const url='/api/attachments/'+encodeURIComponent(a.id);
+    return `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="${esc(a.filename || 'Image')}"><img src="${esc(url)}" alt="${esc(a.filename || 'Image')}" loading="lazy" width="96" height="80"></a>`;
+  }).join('')}</div>`;
+}
 async function send(key) {
   if(!key) {
-    const text=$('input').value.trim(); if(!text) return;
+    const text=$('input').value.trim(); if(!text && !draftImages.size) return;
+    if(imageDraftProblem()) { renderDraftImages(); return; }
     navigationEpoch++;
-    key=crypto.randomUUID(); pending.set(key,{text}); $('input').value='';
+    // Snapshot and detach synchronously. New uploads belong to the next message.
+    const attachments=[...draftImages.values()].map(item=>item.metadata);
+    key=crypto.randomUUID(); pending.set(key,{text,attachments}); $('input').value='';
+    for(const imageKey of [...draftImages.keys()]) removeDraftImage(imageKey);
+    imageNotice=''; renderDraftImages();
   }
   const item=pending.get(key); if(!item || item.sending) return;
+  // Freeze the full idempotency payload before the first attempt, including order.
+  if(!item.payload) item.payload=Object.freeze({text:item.text,request_id:key,attachments:Object.freeze((item.attachments || []).map(a=>a.id))});
   item.sending=true; item.failed=null; renderThread(); scheduleSync();
   let accepted=false; const questionId=data.router.question?.id;
-  try { await api('messages',{text:item.text,request_id:key}); accepted=true; rememberAnswer('router',questionId); pending.delete(key); error(''); await sync(); }
+  try { await api('messages',item.payload); accepted=true; rememberAnswer('router',questionId); pending.delete(key); error(''); await sync(); }
   catch(e) { item.failed=e.message; }
   finally { item.sending=false; renderThread(); }
   return accepted;
@@ -2171,7 +2298,7 @@ async function sync() {
       const trafficRows=new Map(messages);
       const next=await api('state'); clockOffset=next.time-Date.now()/1000;
       if(authRequired) { authRequired=false; startStream(); error(''); }
-      retainCompletedRoutes(next); data=next; renderHeader();
+      retainCompletedRoutes(next); data=next; renderHeader(); renderDraftImages();
       const fingerprint=JSON.stringify([data.tasks,data.items,data.counts,data.max_workers,data.live,data.reminders?.items,data.characters,data.harness_icon]);
       if(fingerprint!==lastState) { lastState=fingerprint; renderActivity(); renderReminders(); renderTasks(); }
       if(!state.historical) {
@@ -2254,6 +2381,8 @@ document.addEventListener('click', async e => {
     else if(d.filter) { state.filter=d.filter; renderModal(); }
     else if(d.table && workerFilters[d.table]) { state.tableFilter=d.table; renderTasks(); }
     else if(d.steps) { const id=Number(d.steps); state.open.has(id)?state.open.delete(id):state.open.add(id); renderThread(); }
+    else if(d.imageRemove) removeDraftImage(d.imageRemove);
+    else if(d.imageRetry) await uploadImage(d.imageRetry);
     else if(d.retry) send(d.retry);
     else if(d.older) { navigationEpoch++; await history(Math.min(...messages.keys())); }
     else if(d.latest) { navigationEpoch++; await history(); await sync(); }
@@ -2307,6 +2436,7 @@ document.addEventListener('error', e=>{
   else if(src==='/api/avatar') e.target.replaceWith(document.createTextNode(Array.from(data.user.name || 'You')[0]));
 }, true);
 $('send').onclick=()=>send();
+bindComposerImages();
 $('input').addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
 $('theme').onclick=()=>{ const theme=document.documentElement.dataset.theme==='dark'?'light':'dark'; document.documentElement.dataset.theme=theme; localStorage.setItem('theme',theme); };
 state.chatRoutingOpen=localStorage.getItem('chatRouting')==='open' || (localStorage.getItem('chatRouting')!=='closed' && !matchMedia('(max-width:760px)').matches);

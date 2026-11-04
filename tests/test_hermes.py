@@ -44,14 +44,14 @@ def state(home, hid="hermes-session"):
             reasoning_content TEXT, active INTEGER DEFAULT 1, compacted INTEGER DEFAULT 0,
             display_kind TEXT DEFAULT 'visible');
         CREATE TABLE IF NOT EXISTS session_admissions(
-            seq INTEGER PRIMARY KEY, target_session_id TEXT, admission_id TEXT, status TEXT);
+            seq INTEGER PRIMARY KEY, target_session_id TEXT, admission_id TEXT, status TEXT, outcome TEXT);
     """)
     return db
 
 
 class HermesLiveGuardTests(unittest.TestCase):
     def test_manual_script_has_a_fail_closed_guard_before_launch_setup(self):
-        # Static only: the live script is never imported or executed by this suite.
+        # This guard check is static; it does not invoke the live entrypoint.
         import ast
         source = Path(__file__).with_name("hermes_live.py").read_text()
         tree = ast.parse(source)
@@ -374,6 +374,27 @@ class HermesProcessTests(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: self.results())
         self.assertEqual(self.results()[0]["result"], "fake answer")
         self.assertEqual(hermes.prepare_session(self.cfg, "s"), ("s", True))
+
+    async def test_lost_admission_becomes_unknown_only_after_load_then_is_interrupted(self):
+        from tests.hermes_live import admission_states, observe_loaded_unknown
+        first = self.process()
+        await first.start()
+        first.send("first")
+        await self.until(lambda: self.results())
+        await first.close(wait=.1)
+        path = Path(first.spec["home"]) / "state.db"
+        hid = first.spec["hermes_id"]
+        with sqlite3.connect(path) as db:
+            db.execute("INSERT INTO session_admissions(target_session_id,admission_id,status) VALUES(?,?,?)",
+                       (hid, "lost-started", "started"))
+        self.assertEqual(first._unknown(), [], "owner death has not yet run recovery")
+        self.assertEqual(admission_states(path, hid)["lost-started"]["status"], "started")
+        resumed = self.process(resume=True)
+        observe_loaded_unknown(resumed)
+        await resumed.start()
+        self.assertEqual(resumed.live_check_unknown_after_load, ["lost-started"])
+        self.assertEqual(resumed._unknown(), [])
+        self.assertEqual(admission_states(path, hid)["lost-started"], {"status": "terminal", "outcome": "interrupted"})
 
     async def test_error_response_and_disconnect_are_safe_unacknowledged_failures(self):
         for command in ("ERROR", "CRASH"):

@@ -15,6 +15,8 @@ from .adapters import procs
 from .router import tools
 from .adapters import session_harness
 from .events.bus import LIMITS, Bus
+from .events.github import GitHubNotifications
+from .router.observations import DENIED, READ_TOOLS
 from .core.items import Items, brief_header
 from .channels.outbox import Outbox
 from .channels.watch import Watch
@@ -44,7 +46,8 @@ class Service:
         self.tasks = Tasks(cfg, self.store, self.on_task_change, self.issue_token, self.items)
         self.watch = Watch(self.store, self.tasks, self.items)
         self.router = Router(cfg, self.store, self.tasks, self.outbox, self.issue_token)
-        self.bus = Bus(self.store, self.router, self.outbox, cfg.sources, cfg.rules, self.tasks)
+        self.bus = Bus(self.store, self.router, self.outbox, cfg.sources, cfg.rules, self.tasks, cfg.github)
+        self.github = GitHubNotifications(self.store, self.bus, cfg.github) if cfg.github is not None else None
         self.reminders = Reminders(self.store, self.router, self.outbox, bus=self.bus)
         self.owner_token = self._owner_token()
         self.stopping = asyncio.Event()
@@ -88,6 +91,8 @@ class Service:
             if name == "report_done":
                 return await self.tasks.hand_in(task_id, args["text"], tool_use_id)
             return self.worker_tool(task_id, name, args)
+        if role == "router" and self.router.observation_only() and name not in READ_TOOLS | {"observe_note"}:
+            raise ValueError(DENIED)
         key = tools.chat_call_key(name, args)
         try:
             result = await self.router_tool(name, args, tool_use_id)
@@ -192,6 +197,10 @@ class Service:
 
     async def _router_tool(self, name, args):
         tasks, router = self.tasks, self.router
+        if name == "observe_note":
+            if set(args) != {"event_id", "would_do", "route"}:
+                raise ValueError("invalid observe_note arguments")
+            return router.observe_note(**args)
         if name in ('memory_read', 'memory_write'):
             required = set() if name == 'memory_read' else {'content', 'version'}
             if set(args) != required:
@@ -224,7 +233,7 @@ class Service:
         if name == "worker_hire":
             def start():
                 task = tasks.start(args["name"], args["brief"], args.get("profile"), args.get("repo"), args.get("reason", ""), self._origin(),
-                                   args.get("item"), args.get("wait_for"), args.get("code_name"), args.get("role", ""))
+                                   args.get("item"), args.get("wait_for"), args.get("code_name"), args.get("role", ""), **({"attachments": args["attachments"]} if "attachments" in args else {}))
                 # Effects keep a stable id; the model sees the current code name even after a rename.
                 result = {"task_id": task["id"], "status": task["status"], "profile": task["profile"],
                           "item": self.items.of(task["id"])}
@@ -235,7 +244,10 @@ class Service:
                     if not waiting:
                         result["note"] = "every upstream has completed; it starts in a moment"
                 return result
-            return router.once(name, name + args["brief"], start)
+            identity = name + args["brief"]
+            if args.get("attachments"):
+                identity = json.dumps([name, args["brief"], args["attachments"]])
+            return router.once(name, identity, start)
         if name == "worker_wait_for":
             return tasks.wait_for(args["worker"], args["wait_for"])
         if name == "item_create":
@@ -260,8 +272,11 @@ class Service:
             return result
         if name in ("worker_assign", "worker_say"):
             action = tasks.send if name == "worker_assign" else tasks.say
-            return router.once(name, name + args["worker"] + args["text"],
-                               lambda: action(args["worker"], args["text"], args.get("expected_status")))
+            identity = name + args["worker"] + args["text"]
+            if args.get("attachments"):
+                identity = json.dumps([name, args["worker"], args["text"], args["attachments"]])
+            return router.once(name, identity,
+                               lambda: action(args["worker"], args["text"], args.get("expected_status"), **({"attachments": args["attachments"]} if "attachments" in args else {})))
         if name == "worker_interrupt":
             return tasks.interrupt(args["worker"])
         if name == "worker_resume":
@@ -469,6 +484,8 @@ class Service:
             self.cfg.sock.unlink(missing_ok=True)
             raise
         reminder_monitor = asyncio.create_task(self.monitor_reminders())
+        if self.github:
+            self.github.start()
         self.startup_notice(recovered)
         self.store.set("service_pid", os.getpid())
         monitor = asyncio.create_task(self.monitor())
@@ -481,6 +498,8 @@ class Service:
             reminder_monitor.cancel()
             await asyncio.gather(monitor, reminder_monitor, return_exceptions=True)
             await self.reminders.close()
+            if self.github:
+                await self.github.close()
             await self.web.close()
             server.close()
             for writer in list(self.clients):
@@ -494,6 +513,8 @@ class Service:
         reminder_monitor.cancel()
         await asyncio.gather(monitor, reminder_monitor, return_exceptions=True)
         await self.reminders.close()
+        if self.github:
+            await self.github.close()
         await self.web.close()
         server.close()
         for writer in list(self.clients):

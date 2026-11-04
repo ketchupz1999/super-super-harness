@@ -85,8 +85,8 @@ class CompactionEvents(unittest.IsolatedAsyncioTestCase):
 class CompactionLifecycle(ServiceCase):
     async def idle(self, task_id, status="completed"):
         await self.wait_status(task_id, status)
-        await self.until(lambda: task_id not in self.service.tasks.live and task_id not in self.service.tasks.retrying,
-                         label="Worker fully closed")
+        await self.until(lambda: task_id not in self.service.tasks.live and task_id not in self.service.tasks.retrying
+                         and task_id not in self.service.tasks.cleaning, label="Worker fully closed")
         return self.store.task(task_id)
 
     async def acknowledged(self, task_id):

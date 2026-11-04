@@ -27,6 +27,7 @@ from ..ops.config import REPO_ROOT, expand
 from ..core.private_files import persistent_secret
 from .notifications import worker_notice
 from ..core.router_files import DocumentError
+from ..core.attachments import Attachments, limits as image_limits, metadata as attachment_metadata
 
 BODY_LIMIT = 64 * 1024
 HEADER_LIMIT = 16 * 1024
@@ -89,6 +90,8 @@ class Web:
     def __init__(self, service):
         self.service = service
         self.cfg, self.store = service.cfg, service.store
+        self.attachments = Attachments(self.cfg, self.store)
+        self.upload_busy = False
         self.port = self.cfg.web["port"]
         self.cookie_name = "%s_%d" % (COOKIE, self.port)
         self.server = None
@@ -119,7 +122,7 @@ class Web:
         script = re.search(rb"<script>(.*?)</script>", self.page, re.S).group(1)
         digest = base64.b64encode(hashlib.sha256(script).digest()).decode()
         self.csp = ("default-src 'none'; script-src 'sha256-%s'; style-src 'unsafe-inline'; "
-                    "img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" % digest)
+                    "img-src 'self' data: blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" % digest)
         self.version = "unknown"
 
     def _session_key(self):
@@ -245,10 +248,11 @@ class Web:
             if not re.fullmatch(r"[0-9]+", headers.get("content-length", "0")):
                 raise HTTPError(400, "invalid content length")
             size = int(headers.get("content-length", "0"))
-            if size > BODY_LIMIT:
-                raise HTTPError(413, "request body too large")
             url = urlsplit(target)
             path, query = url.path, parse_qs(url.query, keep_blank_values=True)
+            cap = image_limits(self.cfg)["max_bytes"] if method == "POST" and path == "/api/attachments" else BODY_LIMIT
+            if size > cap:
+                raise HTTPError(413, "request body too large")
             # No request path is ever used as a filesystem path.
             if "%" in path or ".." in path or "\\" in path:
                 raise HTTPError(400, "invalid path")
@@ -267,6 +271,42 @@ class Web:
                 return
             if path.startswith("/api") and not self.authorized(headers):
                 raise HTTPError(401, "Open a fresh link with supersuperharness web")
+            if path == "/api/attachments" or path.startswith("/api/attachments/"):
+                if ((headers.get("origin") and headers["origin"] != "http://" + headers["host"])
+                        or headers.get("sec-fetch-site") in ("cross-site", "same-site")):
+                    raise HTTPError(403, "invalid Origin")
+                if method == "POST" and path == "/api/attachments":
+                    if self.upload_busy:
+                        raise HTTPError(429, "another image is uploading; retry shortly")
+                    mime = headers.get("content-type", "").split(";", 1)[0]
+                    if mime not in ("image/png", "image/jpeg", "image/gif", "image/webp"):
+                        raise HTTPError(415, "PNG, JPEG, GIF or WebP required")
+                    self.upload_busy = True
+                    try:
+                        body = await asyncio.wait_for(reader.readexactly(size), 30)
+                        writing = asyncio.create_task(asyncio.to_thread(self.attachments.write, body, query.get("filename", [""])[0], mime))
+                        try:
+                            row = await asyncio.shield(writing)
+                        except asyncio.CancelledError:
+                            # Shutdown must not leave a completed file without its metadata.
+                            self.attachments.record(await writing)
+                            raise
+                        result = self.attachments.record(row)
+                    except ValueError as exc:
+                        raise HTTPError(400, str(exc))
+                    finally:
+                        self.upload_busy = False
+                    await self.response(writer, 200, result)
+                    return
+                if method == "GET" and path.startswith("/api/attachments/"):
+                    try:
+                        row = self.attachments.get(path.removeprefix("/api/attachments/"))
+                        body = await asyncio.to_thread(self.attachments.read, row)
+                    except (ValueError, OSError):
+                        raise HTTPError(404, "image unavailable")
+                    await self.response(writer, 200, body, row["mime"])
+                    return
+                raise HTTPError(405, "method not allowed")
             if method == "GET" and path == "/":
                 await self.response(writer, 200, self.page, "text/html; charset=utf-8")
                 return
@@ -563,7 +603,7 @@ class Web:
         items, items_truncated = self.items()
         return {"reminders": self.service.reminders.list(), "router": self.router_state(), "tasks": [self.task_summary(t, links) for t in rows], "counts": counts,
                 "items": items, "items_truncated": items_truncated, "characters": self.characters(),
-                "harness_icon": self.harness_icon(),
+                "harness_icon": self.harness_icon(), "image_limits": image_limits(self.cfg),
                 "tasks_truncated": sum(counts.values()) > len(rows), "max_workers": self.service.tasks.max_workers,
                 "live": len(self.service.tasks.live), "time": time.time(),
                 "profiles": [{"name": p.name, "model": p.model} for p in self.cfg.profiles.values()],
@@ -654,6 +694,7 @@ class Web:
                 if row["role"] == "router" and row["kind"] == "question" else None
             items.append({"id": row["id"], "role": row["role"], "text": row["text"], "channel": row["channel"],
                           "kind": kind, "title": title, "created": row["created"], "turn_id": turn_id,
+                          "attachments": [attachment_metadata(a) for a in self.attachments.for_message(row["source_id"])] if row["role"] == "user" else [],
                           "status": row["message_status"], "tasks": sorted(linked), "steps": steps, "reminders": reminders,
                           "workers": [self.task_summary(t, links) for task_id in sorted(linked) if (t := self.store.task(task_id))],
                           "steps_truncated": len(events) > 100, "options": json.loads(asked["options"]) if asked else [],
@@ -864,6 +905,14 @@ class Web:
         if method == "GET":
             if path == "/api/state":
                 return self.state()
+            if path == "/api/observations":
+                from ..router.observations import listing, since_time
+                try:
+                    since = since_time(query.get("since", ["1d"])[0])
+                except ValueError as exc:
+                    raise HTTPError(400, str(exc))
+                return {"observations": listing(self.store.db, since, query.get("source", [None])[0],
+                                                 number(query, "limit", 200, 1000))}
             if path == "/api/usage":
                 try:
                     start, end = usage.window(query)
@@ -910,18 +959,26 @@ class Web:
             self.snapshots.pop(text_field(data, "snapshot"), None)
             return {"ok": True}
         if method == "POST" and path == "/api/messages":
-            text = text_field(data, "text")
+            text = text_field(data, "text", required=False)
+            ids = data.get("attachments")
+            ids = [] if ids is None else ids
             key = text_field(data, "request_id")
             if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", key):
                 raise HTTPError(400, "invalid request_id")
             old = self.store.one("SELECT m.id, m.text FROM web_requests w JOIN messages m ON m.id=w.message_id WHERE w.key=?", key)
             if old:
-                if old["text"] != text:
-                    raise HTTPError(409, "request_id already used for different text")
+                if old["text"] != text or [row["id"] for row in self.attachments.for_message(old["id"])] != ids:
+                    raise HTTPError(409, "request_id already used for different text or images")
                 return {"id": old["id"]}
-            with self.store.atomic():
-                message_id = self.service.router.submit("user", text, "web")
-                self.store.run("INSERT INTO web_requests(key, message_id) VALUES(?,?)", key, message_id)
+            try:
+                self.attachments.resolve(ids)
+                if not text.strip() and not ids:
+                    raise ValueError("text or images required")
+                with self.store.atomic():
+                    message_id = self.service.router.submit("user", text, "web", **({"attachments": ids} if ids else {}))
+                    self.store.run("INSERT INTO web_requests(key, message_id) VALUES(?,?)", key, message_id)
+            except ValueError as exc:
+                raise HTTPError(400, str(exc))
             return {"id": message_id}
         match = re.fullmatch(r"/api/workers/([A-Za-z][A-Za-z0-9-]{0,23})(?:/(send|interrupt|resume|stop|model|diff))?", path)
         if match:

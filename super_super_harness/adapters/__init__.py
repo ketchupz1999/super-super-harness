@@ -63,6 +63,23 @@ def get_harness(cfg, profile) -> Harness:
     return _registry[name]
 
 
+class ImageInputUnavailable(ValueError):
+    """The selected Harness/Profile cannot inspect images with its enabled tools."""
+
+
+def image_input(cfg, profile, text, images):
+    """Optional adapter hook: durable text referring to local images, not provider-specific blocks."""
+    if not images:
+        return text
+    from ..core.attachments import image_prompt
+    adapter = get_harness(cfg, profile)
+    instruction = getattr(adapter, "IMAGE_INPUT", None)
+    available = getattr(adapter, "image_input_available", lambda profile: True)
+    if instruction is None or not available(profile):
+        raise ImageInputUnavailable("This Harness/Profile does not support image input with its enabled tools")
+    return image_prompt(text, images, instruction)
+
+
 def session_harness(cfg, profile_name, saved_name=None):
     """Read via the session's original Harness, not a renamed/reconfigured Profile.
 

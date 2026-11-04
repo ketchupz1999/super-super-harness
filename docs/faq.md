@@ -38,7 +38,7 @@ You can do it by hand with git worktrees and several terminals. This project doe
 
 ## Can I run Codex or other agents as Workers?
 
-Not yet. Claude Code is the only Harness that works today; an [experimental Hermes adapter](setup.md#hermes-experimental-workers) does not work with a real Hermes yet. Any agent that implements the [Harness protocol](protocol.md) can become a Worker. Codex is tracked in [#2](https://github.com/ketchupz1999/super-super-harness/issues/2); Pi and DeepSeek Harnesses come later.
+Claude Code remains the default. The [experimental Hermes Worker adapter](setup.md#hermes-experimental-workers) has passed a real-process check on a pinned local build with a fake local Provider. External Providers remain unverified, and the Router must still use Claude Code. Any agent that implements the [Harness protocol](protocol.md) can become a Worker. Codex is not integrated yet and is tracked in [#2](https://github.com/ketchupz1999/super-super-harness/issues/2); Pi and DeepSeek Harnesses come later.
 
 ## Which models can I use?
 

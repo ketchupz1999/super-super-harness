@@ -52,7 +52,7 @@ Each launch gets a private MCP config whose `router` server (`router/mcp_server.
 
 | Tool set | Tools |
 |---|---|
-| Router | `reply`, `ask_user`, `worker_hire`, `worker_assign`, `worker_say`, `worker_wait_for`, `worker_interrupt`, `worker_resume`, `worker_stop`, `worker_switch_model`, `worker_rename`, `worker_read`, `worker_detail`, `worker_search`, `item_create`, `item_update`, `item_read`, `item_list`, `item_close`, `item_attach`, `event_read`, `message_search`, `router_switch_model`, `reminder_add`, `reminder_list`, `reminder_cancel`, `inbox_read`, `memory_read`, `memory_write` |
+| Router | `reply`, `ask_user`, `worker_hire`, `worker_assign`, `worker_say`, `worker_wait_for`, `worker_interrupt`, `worker_resume`, `worker_stop`, `worker_switch_model`, `worker_rename`, `worker_read`, `worker_detail`, `worker_search`, `item_create`, `item_update`, `item_read`, `item_list`, `item_close`, `item_attach`, `event_read`, `observe_note`, `message_search`, `router_switch_model`, `reminder_add`, `reminder_list`, `reminder_cancel`, `inbox_read`, `memory_read`, `memory_write` |
 | Worker | `report_progress`, `report_done`, `ask_user`, `notes_read`, `notes_write`, `request_help`, `subscribe`, `unsubscribe`, `hand_back`, `item_read`, `item_update` (own item only) |
 
 ## Router input and turns
@@ -120,7 +120,7 @@ permission = "notify"     # observe | notify | act
 [[rules]]
 source = "manual"
 type_prefix = "demo."
-action = "wake"           # drop | record | direct | wake
+action = "wake"           # drop | record | direct | wake | observe
 ```
 
 | Action | Effect |
@@ -128,8 +128,17 @@ action = "wake"           # drop | record | direct | wake
 | `drop` / `record` | Kept in the log only |
 | `direct` | Told to you (an alert if critical); no model |
 | `wake` | Queued for the Router as an `<event>` |
+| `observe` | `<event mode="observe">` → `observe_note(event_id, would_do, route)`; no action or user reply |
 
-Permissions cap the action: `observe` → record only; `notify` → direct and wake; `act` → also delivered to subscribed Workers. First matching rule wins; `critical` skips `drop`. Built-in rules: `worker.*` → wake, `reminder.notify` → direct, `reminder.run` → wake (as your own message).
+Permissions cap the action: `observe` → record, or an explicit observation rule; `notify` → direct and wake; `act` → also delivered to subscribed Workers. An observation rule requires observe permission; configuration rejects it for notify/act (subscriptions and act delivery are unchanged). First matching rule wins; `critical` skips `drop`. Built-in rules: `worker.*` → wake, `reminder.notify` → direct, `reminder.run` → wake (as your own message).
+
+**GitHub:** `events/github.py` polls `gh api notifications` independently of Router health, using conditional GET and pagination. Multi-page scans keep the lower cursor until two complete scans agree, so shifting page boundaries can be recovered; HTTP rate-limit cooldowns survive restarts. Notification ID + `updated_at` deduplicates updates; useful fields are bounded to ≤64 KiB, API subjects become browser links, and the initial cutoff/cursor persist in `kv`. No connector configuration → no poller. An observe-permission connector adds a default observation rule after user rules. Each source admits at most 12 observations per rolling hour (GitHub configurable); surplus events remain recorded as `limited` / 超额未观察. Duplicate events consume no quota.
+
+**Observation turns:** queued observations are sent in one Harness input, together with any already-queued user/Worker messages. Only an observation-only input restricts the turn; later arrivals wait for its completion and cannot relax it. Recovery notes preserve the restriction. Queued observations wait while the Router is attached; taking over an active turn restores the owner's interactive MCP permissions, and reattachment restores headless observation restrictions. Notes are write-once in `observations`, keyed by trigger; only events in the current turn can be noted. Final text stays in logs, never the outbox or conversation.
+
+→ **Enforced at the service MCP gate:** only `event_read`, `item_read`, `item_list`, `worker_read`, `worker_detail`, `worker_search`, `message_search`, `memory_read`, `reminder_list`, and `observe_note` are allowed in an observation-only turn. All other Router MCP tools are refused; ordinary/mixed turns keep existing permissions.
+
+→ **Known limit — a convention, not a security boundary:** Harness-native Bash/Write/Edit and other tools do not pass through that gate. The prompt forbids them; the adapter is unchanged. At turn end, observations carry `used_builtin_tools` and all tool names seen in the Router stream except this service's known Router MCP tools (including its read-only tools and `observe_note`), matched exactly from `tools.ROUTER` either bare or with the `mcp__router__` prefix. Every other name is audited, including native Read/Bash/Write/Edit/NotebookEdit, Agent/Task, Skill, other MCP services, Hermes tools and unknown names. Observations sharing a turn with ordinary input carry `mixed_turn=true`; tool use in such turns is not automatically a violation. This audit detects reported calls, not hidden actions, and does not prevent execution.
 
 **Subscriptions:** a Worker on an item subscribes to `item:<code>` and can `subscribe` to other threads. Events from an `act` source on a subscribed thread go to every active subscriber as an `<event>` block; a Worker that should not handle it calls `hand_back`. Built-in events never go to subscribers, so results always reach the Router.
 
@@ -150,9 +159,9 @@ An item has a `code` (`mic-input-3`), name, kind (`delivery` / `standing`), stat
 `channels/web.py` + one page, `channels/web/index.html`, on the service's loop.
 
 - **Login:** a one-time ticket (5 min) from the owner socket → a signed `HttpOnly; SameSite=Strict` cookie (12 h).
-- **Checks:** `Host` must be `127.0.0.1`/`localhost`; POST needs the exact same `Origin` and JSON; bodies ≤ 64 KiB; strict CSP; no CORS; nothing sensitive is logged.
+- **Checks:** `Host` must be `127.0.0.1`/`localhost`; POST needs the exact same `Origin`; JSON bodies ≤ 64 KiB. Only `/api/attachments` accepts raw PNG/JPEG/GIF/WebP bytes, ≤ the configured 10 MiB ceiling, one upload at a time. Header, extension and MIME must agree. Image reads by id require login and reject cross-origin/fetch-site requests; no arbitrary file paths, symlinks or CORS.
 - **Live updates:** SSE only says "something changed"; the page re-reads the database-backed API. Motion in Routing comes only from real events, never timers.
-- **Main API:** `/api/state`, `/api/conversation`, `/api/tasks/<id>` (+ `/diff`, `/send|interrupt|resume|stop|model`), `/api/messages`, `/api/items`, `/api/reminders`, `/api/models`, `/api/router-files/soul|memory`.
+- **Main API:** `/api/state`, `/api/conversation`, `/api/workers/<code_name>` (+ `/diff`, `/send|interrupt|resume|stop|model`), `/api/messages`, `/api/items`, `/api/reminders`, `/api/models`, `/api/observations`, `/api/router-files/soul|memory`.
 
 ## Persistence and recovery
 
@@ -160,8 +169,9 @@ An item has a `code` (`mic-input-3`), name, kind (`delivery` / `standing`), stat
 |---|---|
 | `messages`, `turns`, `effects` | Router inbox, turns, at-most-once tool results |
 | `outbox`, `conversation` | What was said to you, per channel; the conversation the web reads |
+| `attachments`, `message_attachments` | Private image metadata, first source message and ordered message-image links; no automatic cleanup |
 | `tasks`, `worker_runs`, `questions` | Workers, each process run, questions with options |
-| `events`, `triggers`, `deliveries` | App log; bus events with their route; who received what |
+| `events`, `triggers`, `deliveries`, `observations` | App log; bus events with their route; who received what; hypothetical actions, quota status and built-in-tool audit |
 | `items`, `item_tasks`, `subscriptions`, `task_deps` | Items, attachments, subscriptions, dependencies |
 | `reminders`, `reminder_fires` | Schedules and fired occurrences |
 | `kv` | Router session/profile, Harness ids, counters, heartbeat |

@@ -22,3 +22,5 @@ context_window = 1000000
 port = 8765
 user_name = "You"
 user_avatar = ""
+image_max_bytes = 10485760 # Per uploaded image; may be lowered (1–10485760).
+image_max_count = 6        # Per message/explicit forward; may be lowered (1–6).

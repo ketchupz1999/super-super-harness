@@ -71,10 +71,13 @@ def matches(rule, event):
 
 
 class Bus:
-    def __init__(self, store, router, outbox, sources=None, rules=(), tasks=None):
+    def __init__(self, store, router, outbox, sources=None, rules=(), tasks=None, github=None):
         self.store, self.router, self.outbox, self.tasks = store, router, outbox, tasks
         self.sources = dict(sources or {}, **BUILTIN_SOURCES)
+        self.observe_limits = {"github": github["max_observe_per_hour"]} if github is not None else {}
         self.rules = [("rule %d" % number, rule) for number, rule in enumerate(rules, 1)] + list(BUILTIN_RULES)
+        if github is not None and self.sources.get("github") == "observe":
+            self.rules.append(("default github observe", {"source": "github", "action": "observe"}))
 
     def route(self, event):
         """First matching rule wins. A critical event skips drop rules; unregistered sources are only recorded."""
@@ -88,6 +91,8 @@ class Bus:
             if matches(rule, event):
                 label, action = name, rule["action"]
                 break
+        if action == "observe" and permission != "observe":
+            raise ValueError("action = observe requires permission = observe")
         if action in ("direct", "wake") and PERMISSIONS.index(permission) < PERMISSIONS.index("notify"):
             action = "record"
         return label, action
@@ -128,6 +133,15 @@ class Bus:
                 self._direct(trigger_id, event)
             elif route == "wake":
                 self._wake(trigger_id, event)
+            elif route == "observe":
+                now = time.time()
+                count = self.store.one("SELECT COUNT(*) n FROM observations o JOIN triggers t ON t.id=o.trigger_id "
+                                       "WHERE t.source=? AND o.status!='limited' AND o.created>?", event["source"], now - 3600)["n"]
+                limited = count >= self.observe_limits.get(event["source"], 12)
+                message_id = None if limited else self.router.submit("event", self.summary(trigger_id, event), kind=event["type"])
+                self.store.run("INSERT INTO observations(trigger_id, message_id, status, created) VALUES(?,?,?,?)",
+                               trigger_id, message_id, "limited" if limited else "queued", now)
+                self.store.notify({"type": "observation", "source": event["source"]})
         return {"status": "accepted", "trigger_id": trigger_id, "rule": rule, "route": route, "delivered": targets}
 
     def _direct(self, trigger_id, event):

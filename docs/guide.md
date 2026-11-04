@@ -23,6 +23,7 @@ All are `bin/supersuperharness <command>`. Commands marked *offline* read the da
 | `peek` | Open a forked copy of the Router session; the real one keeps running |
 | `reminders` | Active reminders *(offline)* |
 | `events [--limit N]` | Recent events and where they went *(offline)* |
+| `observations [--since 1d] [--source github] [--limit N]` | Hypothetical actions, routing and unobserved surplus events *(offline)* |
 | `emit ...` | Send an event to the bus ([design.md](design.md#event-bus)) |
 | `stop` | Stop the service; Workers pause and resume on next start |
 | `router-reset` | Give the Router a fresh session (Workers, items and history kept) |
@@ -104,6 +105,18 @@ Ask in plain words: "remind me at 9 tomorrow…", "every weekday at 9, summarize
 | `run` | An instruction to the Router, which may hand the work to a Worker. |
 
 One-time reminders take an ISO date and time (local unless an offset is given); repeating ones take a 5-field cron in the machine's timezone. After sleep or downtime only the latest missed occurrence fires. List with `reminders` or the Workers page; cancel by telling the Router or with **Cancel**.
+
+## Observations
+
+[Enable GitHub notifications](setup.md#github-notifications-optional), then review without being notified:
+
+```sh
+bin/supersuperharness observations --since 7d --source github
+```
+
+The offline list shows time, event, browser link, `would_do` and `route`; `--since` accepts `m`, `h`, `d` (default 1 day; default limit 200). Web **System → Models → Observations** shows the last 24 hours, refreshing with the page. `超额未观察` (web: “Not observed (hourly limit)”) means the hourly quota was exhausted; “No note yet” may mean queued, failed or a turn that ended without a note. Neither is silently presented as reviewed.
+
+→ This is a rehearsal: service MCP writes and user replies are blocked only in observation-only turns. Built-in tools rely on the prompt, **not a security boundary**. `used_builtin_tools` lists every reported tool name except this service's known Router MCP tools (including read-only tools and `observe_note`, bare or `mcp__router__`-prefixed). Native reads, NotebookEdit, Agent/Task, Skill, other MCP services, Hermes tools and unknown names are included. `mixed_turn: true` marks shared user/Worker input, where tool use is not automatically a violation. See [enforcement details](design.md#event-bus). In the first few days, compare proposed routes with your own choices, check missing notes, quota overflow and built-in-tool flags before considering broader permissions.
 
 ## Troubleshooting
 

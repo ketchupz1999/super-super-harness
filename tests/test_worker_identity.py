@@ -93,7 +93,8 @@ class IdentityStore(unittest.TestCase):
 class WorkerIdentity(ServiceCase):
     async def idle(self, task_id):
         await self.wait_status(task_id, "completed")
-        await self.until(lambda: task_id not in self.service.tasks.live, label="Worker closed")
+        await self.until(lambda: task_id not in self.service.tasks.live and task_id not in self.service.tasks.cleaning,
+                         label="Worker fully closed")
         return self.store.task(task_id)
 
     def git_repo(self):

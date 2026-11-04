@@ -7,6 +7,13 @@ import time
 
 from ..workers.worker_names import check_code_name, named_task, unused_name
 
+# The outer observations row is aliased as o. System recovery notes do not make a turn mixed.
+OBSERVATION_MIXED_TURN = (
+    "EXISTS (SELECT 1 FROM messages observed JOIN messages ordinary ON ordinary.turn_id=observed.turn_id "
+    "LEFT JOIN observations other ON other.message_id=ordinary.id "
+    "WHERE observed.id=o.message_id AND ordinary.role!='system' AND other.trigger_id IS NULL)"
+)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,6 +181,19 @@ CREATE TABLE IF NOT EXISTS triggers (
   created REAL NOT NULL,
   UNIQUE(source, event_id)
 );
+CREATE TABLE IF NOT EXISTS observations (
+  trigger_id INTEGER PRIMARY KEY,
+  message_id INTEGER UNIQUE,
+  status TEXT NOT NULL,          -- queued | limited | noted
+  would_do TEXT NOT NULL DEFAULT '',
+  route TEXT NOT NULL DEFAULT '',
+  used_builtin_tools INTEGER NOT NULL DEFAULT 0,
+  builtin_tools TEXT NOT NULL DEFAULT '[]',
+  mixed_turn INTEGER NOT NULL DEFAULT 0,
+  created REAL NOT NULL,
+  noted REAL
+);
+CREATE INDEX IF NOT EXISTS triggers_source_created ON triggers(source, created);
 -- Items and what hangs off them.
 CREATE TABLE IF NOT EXISTS items (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -205,6 +225,22 @@ CREATE TABLE IF NOT EXISTS questions (
 );
 CREATE INDEX IF NOT EXISTS questions_task ON questions(task_id, id);
 CREATE INDEX IF NOT EXISTS questions_outbox ON questions(outbox_id);
+CREATE TABLE IF NOT EXISTS attachments (
+  id TEXT PRIMARY KEY,
+  filename TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  path TEXT NOT NULL UNIQUE,
+  source_message_id INTEGER,
+  created REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS message_attachments (
+  message_id INTEGER NOT NULL,
+  attachment_id TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  PRIMARY KEY(message_id, attachment_id)
+);
 CREATE TABLE IF NOT EXISTS web_requests (key TEXT PRIMARY KEY, message_id INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
@@ -227,6 +263,12 @@ class Store:
         self._migrate_web()
 
     def _migrate_web(self):
+        # Adding the marker and reconstructing historical attribution must succeed together.
+        with self.atomic():
+            columns = {row["name"] for row in self.all("PRAGMA table_info(observations)")}
+            if "mixed_turn" not in columns:
+                self.run("ALTER TABLE observations ADD COLUMN mixed_turn INTEGER NOT NULL DEFAULT 0")
+                self.run("UPDATE observations AS o SET mixed_turn=" + OBSERVATION_MIXED_TURN)
         for table, fields in {"tasks": {"state_since": "REAL", "started": "REAL", "base_commit": "TEXT"},
                               "events": {"turn_id": "INTEGER"}}.items():
             columns = {row["name"] for row in self.all("PRAGMA table_info(%s)" % table)}

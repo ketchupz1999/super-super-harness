@@ -8,6 +8,7 @@ How to plug an agent product (Codex, Pi, …) in as a Worker or Router. The cont
 |---|---|
 | Run headless and stream its output | The service drives it without a terminal |
 | Accept more input on a running session | Follow-ups, answers, events |
+| Accept local images via `image_input(cfg, profile, text, images)` | Optional adapter `IMAGE_INPUT` instructions turn validated image metadata (id, filename, MIME, size, hash, absolute path) into durable text. Claude Code uses `Read`; Hermes uses `vision_analyze(image_url=path, question=...)`. The optional `image_input_available(profile)` hook checks required tools (Claude Code requires `Read`). Unsupported adapters/Profiles reject images, not silently drop them. |
 | Call MCP tools | Workers report back and the Router acts only through our tools |
 | Resume a session by id | Follow-ups after a turn ends, restarts, model switches |
 | Interrupt a turn | Interrupt and stop |
@@ -91,7 +92,7 @@ Translate your native output into these. Unknown events are ignored.
 
 ## Hermes (experimental)
 
-**Not working with a real Hermes yet.** The first live check failed: the model was not offered the `mcp__router__*` tools, and a cold start took about 55 s (handshake limit 30 s). The mapping below is the intended design, checked against Hermes source at `6b8fa991464d56680fc3ddd93755c8669412a44c` (a local build, not a published upstream commit); automated tests use a **fake ACP executable**. [Setup and restrictions](setup.md#hermes-experimental-workers).
+**Headless Worker live check passed on 2026-11-04:** real Hermes `6b8fa991464d56680fc3ddd93755c8669412a44c` (a local build, not a published upstream commit), macOS / CPython 3.14.7, and a **fake loopback Provider**. All 32 checks passed, including actual MCP/reporting, both auth modes, interrupt, resume/model selection and crash recovery. This does not validate external Providers, interactive takeover or Router execution. Regular automated tests still use a fake ACP executable. [Setup and restrictions](setup.md#hermes-experimental-workers).
 
 One private home owns one session's ACP process, gateway and MCP credentials:
 
@@ -104,18 +105,20 @@ send(uuid) → local queue → input_started → session/prompt
 
 | Area | Hermes mapping / limit |
 |---|---|
-| Process | `hermes acp`, newline JSON-RPC v1; initialize → new/load → set_model (`custom:ssh:MODEL`) → dont_ask mode. Replay is muted. |
+| Process | `hermes acp`, newline JSON-RPC v1; initialize → new/load → set_model (`custom:ssh:MODEL`) → dont_ask mode. Replay is muted. Handshake defaults to 120 s; `[harness.hermes].handshake_timeout` accepts finite positive seconds. |
+| Runtime | Pre-provision one external Python 3.14 venv with `[acp,mcp,anthropic]`. Authoritative `HERMES_DISABLE_LAZY_INSTALLS=1` avoids bootstrap dependency installation; `HERMES_RUNTIME_DIR` names an adapter-owned tool store. Gateway eager warmup/environment probing are disabled; session/state directories remain independent. |
 | Isolation | `SSHARNESS_HOME/hermes/homes/<our-id>/`; mapping in `hermes/sessions/<our-id>.json`. No inherited `HERMES_HOME` or gateway URL. Shared install `.env`, managed installs and unrecognized executable layouts are refused **before execution**. |
-| Configuration | Private JSON-written `config.yaml`; ephemeral system prompt, in-place compaction; source/plugin update checks and plugin auto-apply disabled. Key stays in the environment. Bearer custom endpoints use a fixed `key_cmd`, not a second auth header. |
-| MCP | Configured from session creation; a stable per-home stdio launcher reads current `mcp.json` on launch. Intended to preserve `mcp__router__*` names and avoid freezing a service token; the live check showed the tools are not yet offered to the model. ACP `mcpServers` is empty: Hermes editor-injected servers otherwise get renamed and lose their transport on cold CLI resume. |
+| Configuration | Private JSON-written `config.yaml` with `_config_version: 52`; ephemeral system prompt, in-place compaction, lazy installs and source/plugin update checks disabled. Key stays in the environment. Bearer custom endpoints use a fixed `key_cmd`, not a second auth header. |
+| MCP | Configured from session creation; a stable per-home stdio launcher reads current `mcp.json`. The optional MCP SDK must be installed, and `tools.tool_search.enabled` is `off` so canonical `mcp__router__*` schemas are directly advertised. The live request had 31 tools, including 11 Router tools. ACP `mcpServers` remains empty: editor-injected servers get renamed and lose their transport on cold CLI resume. |
 | Receipts | One prompt at a time. End/cancel responses alone do not prove admission: acknowledge only after finding the unique input marker in a persisted user row. Error responses receive no ACK. No claim of exactly-once tool effects after a crash. |
 | Permissions | Automatically select allow_once/allow_always. `clarify-*` questions receive cancelled; an offered rejection is selected if no allow option exists. Unknown RPCs receive -32601. |
-| Recovery | Load history is hidden; unknown admissions are read from the private DB and discarded by exact ID, then checked again. No automatic replay inside the adapter. Discard does not undo effects. |
+| Recovery | Load history is hidden. A crashed owner's `started` row becomes `unknown` only when the replacement owner initializes; inspect after load, resolve exact IDs with `/discard`, then recheck. The live fixture verifies that the same admission ends `terminal/interrupted`. No automatic replay inside the adapter; discard does not undo effects. |
 | Reads | Read-only schema-32 SQLite, including compacted user rows for delivery checks. Transcript hides hidden/model-only and rewind-removed rows; SQL payload, scan-row, item and text bounds. Truncated structured payloads are skipped, not displayed as base64. Unknown history → empty fallback; unreadable saved state refuses resume rather than abandoning its ID. |
-| Close | Snapshot descendants before stdin closes; track process identities and kill descendant trees plus the ACP process group. A detached child that escapes before being observed remains a live-check risk. |
-| Unsupported | Fork/peek, hooks/Router attach, nondefault tools/settings/add_dirs, saved-session Provider endpoint/identity/auth changes. No api_retry or background_tasks_changed events; agents must wait for background work themselves. Headless Router paths are fixture-tested, not a production recommendation. |
+| Close | Snapshot/track descendant identities and kill their trees plus the ACP process group. Owned output-pipe transports prevent inherited stdout/stderr descriptors from blocking exit notification. Observed live processes were cleaned up; an unobserved detached child can still escape identity-based cleanup. |
+| Diagnostics | Drain stderr separately from JSON-RPC; retain at most 40 lines / 16 KiB, omit overlong lines, redact configured secrets/authorization values/URL userinfo, and save the tail to the private Worker log. |
+| Unsupported | Router execution, fork/peek, hooks/attach, nondefault tools/settings/add_dirs, saved-session Provider endpoint/identity/auth changes. Interactive `open` is not live-validated. No api_retry or background_tasks_changed events; agents must wait for background work themselves. |
 
-`tests.test_hermes`, `tests.test_hermes_state` and `tests.test_hermes_integration` cover protocol, state and service entry points, including real local MCP calls without tool-use metadata. `tests/hermes_live.py` is opt-in only; real startup/auth/terminal propagation and orphan cleanup are **not verified by the fixture suite**.
+`tests.test_hermes`, `tests.test_hermes_state`, `tests.test_hermes_diagnostics` and `tests.test_hermes_integration` cover fake protocol/state/lifecycle and application entry points. The separate, opt-in `tests/hermes_live.py` passed on the pinned build with fresh homes and a local fake Provider; its retained `verification.json` records cold/warm times and the actual observed assertions. It is not an OS network sandbox, an external-Provider certification, or a migration test for old per-home managed environments.
 
 ## Add an adapter
 

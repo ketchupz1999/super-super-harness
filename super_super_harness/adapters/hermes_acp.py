@@ -4,12 +4,14 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import uuid as uuidlib
 
 from . import procs, hermes_state
+from .hermes_diagnostics import StderrTail
 from ..core.private_files import atomic_write
 
-HANDSHAKE_TIMEOUT = 30
+HANDSHAKE_TIMEOUT = 120
 
 
 class RpcError(ValueError):
@@ -28,11 +30,30 @@ class Process:
         self._pending, self._children = {}, {}
         self._sequence = 0
         self._queue = asyncio.Queue()
-        self._pump_task = self._reader = self._monitor = self._close_task = None
+        self._pump_task = self._reader = self._monitor = self._close_task = self._stderr_reader = None
+        self.stderr = StderrTail(env, self.spec["home"])
+        self._stdout = self._stderr = None
+        self._stdout_transport = self._stderr_transport = None
+        self._finish_task = None
         self._in_prompt = False
         self._message_id, self._kind, self._chunks = None, None, []
         self._turn_text = []
         self._completed_tools = set()
+
+    async def _output_pipe(self):
+        # Own the read transport so inherited descriptors cannot keep proc.wait()
+        # pending after the ACP parent exits. No private asyncio transports needed.
+        read_fd, write_fd = os.pipe()
+        source = os.fdopen(read_fd, "rb", buffering=0)
+        reader = asyncio.StreamReader(limit=2 ** 24)
+        try:
+            transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+                lambda: asyncio.StreamReaderProtocol(reader), source)
+        except BaseException:
+            source.close()
+            os.close(write_fd)
+            raise
+        return reader, transport, write_fd
 
     async def start(self):
         from .hermes import _check_install
@@ -40,20 +61,29 @@ class Process:
             raise ValueError("Hermes process cannot be started twice or after close")
         self._starting = True
         try:
-            env = dict(self.env, HERMES_HOME=self.spec["home"])
+            env = dict(self.env, HERMES_HOME=self.spec["home"], HERMES_DISABLE_LAZY_INSTALLS="1",
+                       HERMES_RUNTIME_DIR=self.spec["runtime_dir"])
             env.pop("HERMES_TUI_GATEWAY_URL", None)
             executable = _check_install(self.argv[1], env)
-            self.proc = await asyncio.create_subprocess_exec(
-                executable, *self.argv[2:], cwd=str(self.cwd), env=env, stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                limit=2 ** 24, start_new_session=True)
+            stdout_fd = stderr_fd = None
+            try:
+                self._stdout, self._stdout_transport, stdout_fd = await self._output_pipe()
+                self._stderr, self._stderr_transport, stderr_fd = await self._output_pipe()
+                self.proc = await asyncio.create_subprocess_exec(
+                    executable, *self.argv[2:], cwd=str(self.cwd), env=env, stdin=asyncio.subprocess.PIPE,
+                    stdout=stdout_fd, stderr=stderr_fd, start_new_session=True)
+            finally:
+                for fd in (stdout_fd, stderr_fd):
+                    if fd is not None:
+                        os.close(fd)
             self.pid = self.proc.pid
+            self._stderr_reader = asyncio.create_task(self.stderr.read(self._stderr))
             self._reader = asyncio.create_task(self._read())
             self._monitor = asyncio.create_task(self._track_children())
             self._spawned.set()
             if self.closing:
                 raise ValueError("Hermes launch was closed")
-            await asyncio.wait_for(self._handshake(), HANDSHAKE_TIMEOUT)
+            await asyncio.wait_for(self._handshake(), self.spec.get("handshake_timeout", HANDSHAKE_TIMEOUT))
             if self.closing or self._broken:
                 raise ValueError("Hermes launch was closed")
             await self._remember_children()
@@ -69,10 +99,12 @@ class Process:
             self._spawned.set()
             await asyncio.shield(self.close(wait=.1))
             raise
-        except (OSError, ValueError, asyncio.TimeoutError):
+        except (OSError, ValueError, asyncio.TimeoutError) as exc:
             self._spawned.set()
             await self.close(wait=.1)
-            raise ValueError("Hermes ACP startup failed; check the isolated installation and configuration") from None
+            diagnostic = self.stderr.text()
+            suffix = "\n" + diagnostic if diagnostic else "; check the isolated installation and configuration"
+            raise ValueError("Hermes ACP startup failed (%s)%s" % (type(exc).__name__, suffix)) from None
         finally:
             self._spawned.set()
 
@@ -140,10 +172,12 @@ class Process:
             raise RpcError("Hermes ACP connection closed") from None
         finally:
             self._pending.pop(ident, None)
+            if future.done() and not future.cancelled():
+                future.exception()   # drain may fail before the reply future is awaited
 
     async def _read(self):
         try:
-            while line := await self.proc.stdout.readline():
+            while line := await self._stdout.readline():
                 message = json.loads(line)
                 if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
                     raise RpcError("Invalid Hermes ACP frame")
@@ -168,20 +202,72 @@ class Process:
             for future in self._pending.values():
                 if not future.done():
                     future.set_exception(RpcError("Hermes ACP connection closed"))
+            self._finish_task = asyncio.create_task(self._finish())
+            await asyncio.shield(self._finish_task)
+
+    def _abort_stdin(self):
+        transport = self.proc.stdin.transport
+        try:
+            transport.abort()
+        except AttributeError:
+            # UnixWritePipeTransport.abort is not idempotent on Python 3.12:
+            # a completed close has already cleared its loop. A closing pipe
+            # with buffered input still has a loop and must actually be aborted.
+            if not transport.is_closing():
+                raise
+
+    async def _finish(self):
+        try:
+            await self._cleanup_process()
+        finally:
+            self.exited.set()
+            await self.on_exit(self.proc.returncode)
+
+    async def _cleanup_process(self):
+        try:
             if self._monitor:
                 self._monitor.cancel()
                 await asyncio.gather(self._monitor, return_exceptions=True)
-            await self._remember_children()
-            await asyncio.to_thread(self._kill_children)
+            try:
+                await self._remember_children()
+                await asyncio.to_thread(self._kill_children)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                self.stderr.append(b"[Hermes process inspection failed during cleanup]")
+            self._abort_stdin()
             if self.proc.returncode is None:
                 self.proc.kill()
-            code = await self.proc.wait()
+            await self.proc.wait()
             if self._pump_task:
                 if not self._in_prompt or self.closing:
                     self._pump_task.cancel()
                 await asyncio.gather(self._pump_task, return_exceptions=True)
-            self.exited.set()
-            await self.on_exit(code)
+        finally:
+            self._kill_group()
+            self._abort_stdin()
+            if self.proc.returncode is None:
+                self.proc.kill()
+                await self.proc.wait()
+            self._stdout_transport.close()
+            await self._finish_stderr()
+
+    async def _finish_stderr(self):
+        try:
+            if self._stderr_reader:
+                try:
+                    await asyncio.wait_for(asyncio.shield(self._stderr_reader), 1)
+                except asyncio.TimeoutError:
+                    # A detached descendant may retain fd 2 after the parent died.
+                    self._stderr_transport.close()
+                    await asyncio.wait_for(asyncio.gather(self._stderr_reader, return_exceptions=True), 1)
+                except OSError:
+                    pass
+        finally:
+            if self._stderr_transport:
+                self._stderr_transport.close()
+        try:
+            await asyncio.to_thread(self.stderr.save, self.log_path)
+        except (OSError, ValueError):
+            pass   # a failed diagnostic write must not prevent process cleanup
 
     def _request(self, message):
         ident, method, params = message["id"], message["method"], message.get("params", {})
@@ -304,18 +390,30 @@ class Process:
             await self._remember_children()
             await asyncio.sleep(.5)
         if not self.closing:
-            # An inherited stdout can outlive its parent and hide EOF from _read.
-            await asyncio.to_thread(self._kill_children)
+            # Drain final parent output, but do not wait forever on an inherited fd.
+            try:
+                await asyncio.to_thread(self._kill_children)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                self.stderr.append(b"[Hermes process inspection failed after parent exit]")
+            try:
+                await asyncio.wait_for(self.exited.wait(), 1)
+            except asyncio.TimeoutError:
+                self._stdout_transport.close()
 
-    def _kill_children(self):
-        for pid, started in list(self._children.items()):
-            if procs.alive(pid, started):
-                procs.kill_tree(pid)
-        # Also catch children forked between snapshots, including after parent exit.
+    def _kill_group(self):
         try:
             os.killpg(self.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+
+    def _kill_children(self):
+        try:
+            for pid, started in list(self._children.items()):
+                if procs.alive(pid, started):
+                    procs.kill_tree(pid)
+        finally:
+            # Also catch children forked between snapshots, even if inspection fails.
+            self._kill_group()
 
     async def close(self, wait=5):
         self.closing = True
@@ -329,20 +427,33 @@ class Process:
         if self._starting and not self._spawned.is_set():
             await self._spawned.wait()
         if not self.proc:
+            for transport in (self._stdout_transport, self._stderr_transport):
+                if transport:
+                    transport.close()
             self.exited.set()
             return
         if self._pump_task:
             self._pump_task.cancel()
-        await self._remember_children()
+        try:
+            await self._remember_children()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            self.stderr.append(b"[Hermes process inspection failed during close]")
         if not self.proc.stdin.is_closing():
             self.proc.stdin.close()
         try:
             await asyncio.wait_for(self.exited.wait(), wait)
         except asyncio.TimeoutError:
-            await self._remember_children()
-            await asyncio.to_thread(self._kill_children)
-            if self.proc.returncode is None:
-                self.proc.kill()
+            try:
+                await self._remember_children()
+                await asyncio.to_thread(self._kill_children)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                self.stderr.append(b"[Hermes process inspection failed during forced close]")
+            finally:
+                self._kill_group()
+                self._abort_stdin()
+                if self.proc.returncode is None:
+                    self.proc.kill()
+                self._stdout_transport.close()
             try:
                 await asyncio.wait_for(self.exited.wait(), 2)
             except asyncio.TimeoutError:

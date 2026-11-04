@@ -31,6 +31,9 @@ STRINGS = {"type": "array", "items": {"type": "string"}}
 
 
 ROUTER = [
+    tool("observe_note", "Record once what you would do for a mode=observe event in this turn, without acting or notifying the user. "
+         "event_id: the event's trigger ID; would_do: one or two sentences; route: a Worker code name, new Worker, tell user, or ignore.",
+         ["event_id", "would_do", "route"], event_id="integer", would_do="string", route="string"),
     tool("memory_read", "Read current Router memory and its version before editing."),
     tool("memory_write", "Save merged Router memory using the version from memory_read. On conflict, read again and merge; do not use file tools.",
          ["content", "version"], content="string", version="string"),
@@ -42,9 +45,9 @@ ROUTER = [
          "item: required item code (legacy callers omitting it fall back to Miscellaneous). "
          "code_name: a memorable unique name, 1–24 letters/digits/hyphens starting with a letter. role: one-line responsibility. "
          "wait_for: Workers whose results it needs; names or internal ids, case-insensitive, names take precedence. "
-         "It starts by itself when all upstream Workers complete.",
+         "It starts by itself when all upstream Workers complete. attachments: explicitly forward uploaded image ids; omitted means no images.",
          ["name", "brief", "item", "code_name", "role"], name="string", brief="string", profile="string", repo="string", reason="string", item="string", wait_for=STRINGS,
-         code_name="string", role="string"),
+         code_name="string", role="string", attachments=STRINGS),
     tool("worker_wait_for", "Replace the upstream Workers a waiting Worker needs. An empty list starts it now. "
          "Worker parameters accept names or internal ids, case-insensitive, names first.", ["worker", "wait_for"],
          worker="string", wait_for=STRINGS),
@@ -63,11 +66,13 @@ ROUTER = [
          "worker: code name or internal id, case-insensitive, code name first.",
          ["item", "worker"], item="string", worker="string", move="boolean"),
     tool("worker_assign", "Give an existing Worker new work, recording an assignment. Pass the status you saw as expected_status. "
+         "attachments: explicitly forward image ids; omitted means no images. "
          "worker: code name or internal id, case-insensitive, code name first.", ["worker", "text"],
-         worker="string", text="string", expected_status="string"),
+         worker="string", text="string", expected_status="string", attachments=STRINGS),
     tool("worker_say", "Insert a message into a Worker's conversation without creating an assignment, for example a clarification or pause request. "
+         "attachments: explicitly forward image ids; omitted means no images. "
          "An idle Worker wakes to read it. worker: code name or internal id, case-insensitive, code name first.",
-         ["worker", "text"], worker="string", text="string"),
+         ["worker", "text"], worker="string", text="string", attachments=STRINGS),
     tool("worker_interrupt", "Interrupt a Worker's current turn; progress is kept. worker: code name or internal id, case-insensitive, names first.",
          ["worker"], worker="string"),
     tool("worker_resume", "Continue an interrupted, failed or dormant Worker. worker: code name or internal id, case-insensitive, names first.",

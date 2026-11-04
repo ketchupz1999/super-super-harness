@@ -11,7 +11,7 @@ from ..paths import REPO_ROOT
 
 SEVERITIES = ("info", "warn", "critical")
 PERMISSIONS = ("observe", "notify", "act")
-ACTIONS = ("drop", "record", "direct", "wake")
+ACTIONS = ("drop", "record", "direct", "wake", "observe")
 RULE_CONDITIONS = ("source", "type_prefix", "thread_prefix", "severity", "keyword")
 BUILTIN_SOURCES = {"worker": "act", "reminder": "notify"}
 SOURCE_NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}")
@@ -31,17 +31,27 @@ def parse_routing(raw_sources, raw_rules):
     for name, item in raw_sources.items():
         if not SOURCE_NAME.fullmatch(name) or name in BUILTIN_SOURCES:
             raise PublicConfigurationError("Source names must be lowercase letters, digits, '-' or '_', and not worker or reminder. Edit [sources] in the private profiles.toml.")
-        if not isinstance(item, dict) or set(item) - {"permission"} or item.get("permission", "observe") not in PERMISSIONS:
-            raise PublicConfigurationError("[sources.%s] accepts only permission = observe, notify or act. Edit the private profiles.toml." % name)
+        allowed = {"permission"}
+        if name == "github" and isinstance(item, dict) and item.get("kind") == "github_notifications":
+            allowed |= {"kind", "interval_seconds", "repos", "env", "max_observe_per_hour"}
+            github_options(item)
+        if not isinstance(item, dict) or set(item) - allowed or item.get("permission", "observe") not in PERMISSIONS:
+            raise PublicConfigurationError("[sources.%s] has invalid settings; use permission = observe, notify or act. "
+                                           "Only sources.github supports kind = github_notifications. Edit the private profiles.toml." % name)
         sources[name] = item.get("permission", "observe")
     rules = []
     for number, item in enumerate(raw_rules, 1):
         if (not isinstance(item, dict) or item.get("action") not in ACTIONS or set(item) - {"action", *RULE_CONDITIONS}
                 or any(not isinstance(item[key], str) or not item[key] for key in RULE_CONDITIONS if key in item)
                 or item.get("severity", "info") not in SEVERITIES):
-            raise PublicConfigurationError("[[rules]] #%d needs action = drop, record, direct or wake, and only source, type_prefix, "
+            raise PublicConfigurationError("[[rules]] #%d needs action = drop, record, direct, wake or observe, and only source, type_prefix, "
                                            "thread_prefix, severity (info, warn, critical) or keyword as nonempty strings. "
                                            "Edit the private profiles.toml." % number)
+        if item["action"] == "observe":
+            permissions = [sources.get(item["source"], BUILTIN_SOURCES.get(item["source"]))] if "source" in item else list(sources.values())
+            if any(permission != "observe" for permission in permissions):
+                raise PublicConfigurationError("[[rules]] #%d: action = observe requires permission = observe for every source it can match. "
+                                               "Name an observe source explicitly; notify/act delivery is unchanged." % number)
         # Name only the rule and field: the value is user text.
         if "source" in item and item["source"] not in sources and item["source"] not in BUILTIN_SOURCES:
             raise PublicConfigurationError("[[rules]] #%d: source is not declared in [sources.<name>] (or worker, reminder). "
@@ -55,6 +65,22 @@ def parse_routing(raw_sources, raw_rules):
                                            "Edit the private profiles.toml." % number)
         rules.append(dict(item))
     return sources, tuple(rules)
+
+
+def github_options(item):
+    options = {"interval_seconds": 120, "repos": [], "env": {}, "max_observe_per_hour": 12}
+    options.update({key: item[key] for key in options if key in item})
+    if (type(options["interval_seconds"]) is not int or options["interval_seconds"] < 1
+            or type(options["max_observe_per_hour"]) is not int or options["max_observe_per_hour"] < 0
+            or not isinstance(options["repos"], list)
+            or any(not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) for repo in options["repos"])
+            or not isinstance(options["env"], dict)
+            or any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                   or any(word in key.upper() for word in ("TOKEN", "KEY", "SECRET", "PASSWORD", "DEBUG"))
+                   or "\x00" in value for key, value in options["env"].items())):
+        raise PublicConfigurationError("[sources.github] needs positive integer interval_seconds, nonnegative integer max_observe_per_hour, "
+                                       "repos = [\"owner/repo\"], and non-secret string env values. Authenticate with gh auth login.")
+    return options
 
 
 def expand(path):
@@ -144,6 +170,7 @@ class Config(Paths):
     web: dict = field(default_factory=lambda: {"port": 8765, "user_name": "You", "user_avatar": "", "router_name": "Router"})
     sources: dict = field(default_factory=dict)
     rules: tuple = ()
+    github: dict | None = None
 
     @property
     def workspaces(self):
@@ -230,15 +257,21 @@ def from_raw(raw, home):
     failover = {"silent_seconds": 20, "deep_probe_seconds": 120, "retries": 5, "probe_timeout": 5,
                 "wake_grace_seconds": 90, "primary_check_seconds": 300}
     failover.update(raw.get("failover", {}))
-    web = {"port": 8765, "user_name": "You", "user_avatar": "", "router_name": "Router"}
+    web = {"port": 8765, "user_name": "You", "user_avatar": "", "router_name": "Router",
+           "image_max_bytes": 10 * 1024 * 1024, "image_max_count": 6}
     web.update(raw.get("web", {}))
+    for key, maximum in (("image_max_bytes", 10 * 1024 * 1024), ("image_max_count", 6)):
+        if type(web[key]) is not int or not 1 <= web[key] <= maximum:
+            raise ValueError("web.%s must be an integer between 1 and %d" % (key, maximum))
     if (not isinstance(web["router_name"], str) or not web["router_name"].strip() or
             len(web["router_name"]) > 80 or any(ord(c) < 32 for c in web["router_name"])):
         raise ValueError("web.router_name must be a nonempty name of at most 80 characters")
     if type(web["port"]) is not int or not 0 <= web["port"] <= 65535:
         raise ValueError("web.port must be between 0 and 65535")
     sources, rules = parse_routing(raw.get("sources", {}), raw.get("rules", []))
-    return Config(home=home, web=web, sources=sources, rules=rules, profiles=profiles, providers=providers, harnesses=dict({"claude-code": {"binary": "claude"}}, **raw.get("harness", {})),
+    github = raw.get("sources", {}).get("github", {})
+    github = github_options(github) if github.get("kind") == "github_notifications" else None
+    return Config(home=home, web=web, sources=sources, rules=rules, github=github, profiles=profiles, providers=providers, harnesses=dict({"claude-code": {"binary": "claude"}}, **raw.get("harness", {})),
                   default_profile=raw["default_profile"], primary=raw["router"]["primary"],
                   backup=raw["router"]["backup"], limits=limits, failover=failover,
                   session_root=expand(raw.get("session_root", "~/.claude/projects")),

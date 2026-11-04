@@ -14,7 +14,8 @@ import uuid as uuidlib
 
 from ..adapters import procs
 from . import workspace
-from ..adapters import get_harness
+from ..adapters import get_harness, image_input
+from ..core.attachments import Attachments
 from ..paths import MCP_SERVER, PROMPTS_DIR
 from ..core.items import Items, brief_header, data
 from .worker_names import check_code_name, named_task
@@ -100,6 +101,8 @@ class Tasks:
         self.retrying = set()    # queued follow-ups cannot overtake a failed assignment's backoff
         self.releasing = set()
         self.unwinding = set()   # launches that were ended but have not returned yet: no slot, and no second launch meanwhile
+        self.cleaning = Counter()   # close + sweep and its model transition must finish before this Worker starts again
+        self.cleanup_waiters = {}   # interactive takeover also waits for overlapping cleanups, outside schedule()
         self.closed = False
         self.max_workers = cfg.limits["max_workers"]
         self.caller_wait = CALLER_WAIT
@@ -184,9 +187,10 @@ class Tasks:
 
     # commands
     def start(self, name, brief, profile=None, repo=None, reason="", origin_channel="", item=None, wait_for=None,
-              code_name=None, role=""):
+              code_name=None, role="", attachments=None):
         profile = profile or self.cfg.default_profile
         self.cfg.profile(profile)
+        brief = self._image_input(profile, brief, attachments)
         upstream = self._check_upstream(wait_for)
         with self.store.atomic():
             record = self.items.get(item, require_open=True) if item is not None else self.items.miscellaneous()
@@ -341,20 +345,27 @@ class Tasks:
                                      "上游 %s · %s %s，本 Worker 还在等待，没有开始。可以 worker_resume 上游、用 worker_wait_for 改依赖，或 worker_stop 本 Worker。"
                                      % (upstream["code_name"], clip(upstream["name"], 80), LABELS[upstream["status"]]))
 
-    def send(self, task_id, text, expected=None, source="router"):
+    def _image_input(self, profile, text, attachments):
+        if attachments is None or attachments == []:
+            return text
+        files = Attachments(self.cfg, self.store)
+        return image_input(self.cfg, self.cfg.profile(profile), text, files.inputs(files.resolve(attachments, sent=True)))
+
+    def send(self, task_id, text, expected=None, source="router", attachments=None):
         """New work, recorded as an assignment before delivery."""
-        return self._message(task_id, text, expected, source, assign=True)
+        return self._message(task_id, text, expected, source, assign=True, attachments=attachments)
 
-    def say(self, task_id, text, expected=None):
+    def say(self, task_id, text, expected=None, attachments=None):
         """Conversation input only: wake an idle Worker without adding an assignment."""
-        return self._message(task_id, text, expected, "router", assign=False)
+        return self._message(task_id, text, expected, "router", assign=False, attachments=attachments)
 
-    def _message(self, task_id, text, expected, source, *, assign):
+    def _message(self, task_id, text, expected, source, *, assign, attachments=None):
         task = self._require(task_id)
         if expected and expected != task["status"]:
             return {"ok": False, "error": "state changed", "status": task["status"], "progress": task["progress"]}
         if task["status"] == "stopped":
             return {"ok": False, "error": "Worker is stopped", "status": "stopped"}
+        text = self._image_input(task["profile"], text, attachments)
         with self.store.atomic():
             say_id = None
             if assign:
@@ -417,12 +428,15 @@ class Tasks:
         if new.harness != self.cfg.profile(task["profile"]).harness:
             return {"ok": False, "error": "switching Harness is not supported yet"}
         was_running = task_id in self.live
-        await self._end_process(task_id)
-        self.store.update_task(task_id, profile=profile)
-        self.store.event("router", "task.model", task_id, profile=profile)
-        if was_running:
-            self._queue_input(task_id, "Your model was switched. Continue from where you stopped.", first=True)
-            self.schedule()
+        self.cleaning[task_id] += 1   # cleanup must not wake queued input before the new profile is committed
+        try:
+            await self._end_process(task_id)
+            self.store.update_task(task_id, profile=profile)
+            self.store.event("router", "task.model", task_id, profile=profile)
+            if was_running:
+                self._queue_input(task_id, "Your model was switched. Continue from where you stopped.", first=True)
+        finally:
+            self._cleaned(task_id)
         return {"ok": True, "profile": profile, "status": self.store.task(task_id)["status"]}
 
     async def hold(self, task_id):
@@ -433,13 +447,15 @@ class Tasks:
         self.held.add(task_id)
         try:
             await self._end_process(task_id)
+            while task_id in self.cleaning:
+                await self.cleanup_waiters.setdefault(task_id, asyncio.Event()).wait()
             if self.store.task(task_id)["status"] in ("running", "queued"):
                 self.store.update_task(task_id, status="interrupted")
             task = dict(self.store.task(task_id))
             task["system_prompt"] = self.system_prompt(task_id) if task["workspace"] else None
             return task
         except BaseException:
-            self.held.discard(task_id)
+            self.release(task_id)
             raise
 
     def release(self, task_id):
@@ -573,7 +589,8 @@ class Tasks:
             if len(self.live) >= self.max_workers:
                 break
             task_id = row["id"]
-            if task_id in self.live or task_id in self.held or task_id in self.unwinding or task_id in self.expiring or task_id in self.retrying:
+            if (task_id in self.live or task_id in self.held or task_id in self.unwinding
+                    or task_id in self.expiring or task_id in self.retrying or task_id in self.cleaning):
                 continue
             run = self.live[task_id] = Run(pending_uuids=set(), assignments={}, callers={})
             self.store.update_task(task_id, status="running")
@@ -1048,7 +1065,7 @@ class Tasks:
         self.store.run("UPDATE worker_runs SET ended=?, exit_code=? WHERE id=?", time.time(), code, run.run_id)
         if self.live.get(task_id) is run:
             del self.live[task_id]
-        closing = run.process.closing
+        closing = run.ending or run.process.closing   # close() may not have entered its coroutine yet
         status = self.store.task(task_id)["status"]
         if not closing and status == "running":
             await self._retry_or_fail(task_id, "process exited with %s and no result" % code, run.current_assignment)
@@ -1065,13 +1082,34 @@ class Tasks:
                 del self.live[task_id]   # a launch in progress gives its slot back now and ends itself at its next step
                 self.unwinding.add(task_id)
 
+        self.cleaning[task_id] += 1   # register before _on_exit can remove the old run from live
+
+        async def cleanup():
+            try:
+                if run and run.process:
+                    await run.process.close()
+                if root:
+                    await asyncio.to_thread(procs.sweep, root)
+            finally:
+                self._cleaned(task_id)
+
+        pending = asyncio.create_task(cleanup())
+
         async def finish():
-            if run and run.process:
-                await run.process.close()
-            if root:
-                await asyncio.to_thread(procs.sweep, root)
+            # Cancelling a waiter cannot stop a sweep already running in a thread.
+            # The cleanup owns its admission barrier, not the caller waiting for it.
+            await asyncio.shield(pending)
 
         return finish()
+
+    def _cleaned(self, task_id):
+        self.cleaning[task_id] -= 1
+        if not self.cleaning[task_id]:
+            del self.cleaning[task_id]
+            waiter = self.cleanup_waiters.pop(task_id, None)
+            if waiter:
+                waiter.set()
+        self.schedule()
 
     async def _interrupt_fallback(self, task_id, run, wait=10):
         await asyncio.sleep(wait)
@@ -1097,7 +1135,7 @@ class Tasks:
             task = self.store.task(task_id)   # earlier cleanups awaited; this candidate may have worked since then
             if (not task or task["status"] != "completed" or task["last_active"] >= cutoff
                     or not task["workspace"] or json.loads(task["pending"]) or task_id in self.live or task_id in self.held
-                    or task_id in self.unwinding or task_id in self.expiring):
+                    or task_id in self.unwinding or task_id in self.expiring or task_id in self.cleaning):
                 continue
             self.expiring.add(task_id)
             try:

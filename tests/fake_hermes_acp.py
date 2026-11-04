@@ -81,7 +81,7 @@ def turn(ident, prompt):
             words = ["PAUSE"] if "HERMES_HANDOFF_PAUSE" in words else []
         if prompt.startswith("/discard "):
             with sqlite3.connect(HOME / "state.db") as db:
-                db.execute("UPDATE session_admissions SET status='discarded' WHERE admission_id=?", (prompt.split()[1],))
+                db.execute("UPDATE session_admissions SET status='terminal', outcome='interrupted' WHERE admission_id=?", (prompt.split()[1],))
             text("discarded control message")
             result(ident, {"stopReason": "end_turn"})
             return
@@ -102,6 +102,11 @@ def turn(ident, prompt):
             missing.touch()
         if "NO_STORE" not in words and not skip_store:
             save("user", prompt)
+        if "ORPHAN_STDERR" in words:
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True,
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            (HOME / "child.pid").write_text(str(child.pid))
+            os._exit(7)
         if "ORPHAN_PIPE" in words:
             child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
                                      stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -177,6 +182,20 @@ def main():
         print("Hermes ACP check OK")
         return
     HOME.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("SSHARNESS_FAKE_REQUIRE_RUNTIME"):
+        settings = json.loads((HOME / "config.yaml").read_text())
+        assert settings["_config_version"] == 52
+        assert settings["tools"]["tool_search"]["enabled"] == "off"
+        assert settings["security"]["allow_lazy_installs"] is False
+        assert settings["agent"]["gateway_startup_warmup_timeout"] == 0
+        assert settings["agent"]["environment_probe"] is False
+        assert os.environ.get("HERMES_DISABLE_LAZY_INSTALLS") == "1"
+        assert Path(os.environ["HERMES_RUNTIME_DIR"]) == HOME.parent.parent / "runtime"
+    if os.environ.get("SSHARNESS_FAKE_STDERR_FLOOD"):
+        sys.stderr.write("x" * 100000 + "\n")
+    if os.environ.get("SSHARNESS_FAKE_STDERR"):
+        sys.stderr.write(os.environ["SSHARNESS_FAKE_STDERR"])
+        sys.stderr.flush()
     with sqlite3.connect(HOME / "state.db") as db:
         db.executescript("""
             CREATE TABLE IF NOT EXISTS schema_version(version INTEGER);
@@ -185,7 +204,7 @@ def main():
                 timestamp REAL, tool_calls TEXT, tool_call_id TEXT, reasoning TEXT, reasoning_content TEXT,
                 active INTEGER DEFAULT 1, compacted INTEGER DEFAULT 0, display_kind TEXT DEFAULT 'visible');
             CREATE TABLE IF NOT EXISTS session_admissions(seq INTEGER PRIMARY KEY,
-                target_session_id TEXT, admission_id TEXT, status TEXT);
+                target_session_id TEXT, admission_id TEXT, status TEXT, outcome TEXT);
         """)
     for line in sys.stdin:
         frame = json.loads(line)
@@ -197,12 +216,15 @@ def main():
         elif method and method == os.environ.get("SSHARNESS_FAKE_HANG_METHOD"):
             continue
         elif method == "initialize":
+            time.sleep(float(os.environ.get("SSHARNESS_FAKE_INITIALIZE_DELAY", "0")))
             result(ident, {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}})
         elif method == "session/new":
             SESSION = "hermes-" + str(uuid.uuid4())
             result(ident, {"sessionId": SESSION})
         elif method == "session/load":
             SESSION = params["sessionId"]
+            with sqlite3.connect(HOME / "state.db") as db:
+                db.execute("UPDATE session_admissions SET status='unknown' WHERE target_session_id=? AND status='started'", (SESSION,))
             text("historical replay: never deliver", "history")
             update("tool_call", toolCallId="old-call", title="old tool", rawInput={})
             result(ident, {})

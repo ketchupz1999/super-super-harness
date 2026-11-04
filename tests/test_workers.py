@@ -227,6 +227,52 @@ class Lifecycle(ServiceCase):
                 self.assertEqual(self.store.one("SELECT COUNT(*) n FROM worker_runs WHERE task_id=?", task_id)["n"], 2)
                 self.assertEqual(self.store.one("SELECT COUNT(*) n FROM messages WHERE task_id=? AND kind='worker.done'", task_id)["n"], 1)
 
+    async def test_immediate_resume_waits_for_old_workspace_sweep(self):
+        import threading
+        from unittest.mock import patch
+        tasks = self.service.tasks
+        self.cfg.limits["worker_retries"] = 0
+        task_id = self.start_task("SLEEP 60 ECHO old")
+        await self.worker_ready(task_id)
+        old = tasks.live[task_id]
+        root = self.store.task(task_id)["workspace"]
+        entered, release, swept = threading.Event(), threading.Event(), threading.Event()
+        sweep = procs.sweep
+        killed = []
+        def paused_sweep(path):
+            if path == root and not entered.is_set():
+                entered.set()
+                if not release.wait(10):
+                    raise RuntimeError("fixture sweep barrier timed out")
+                try:
+                    killed.extend(sweep(path))
+                    return killed
+                finally:
+                    swept.set()
+            return sweep(path)
+        with patch.object(procs, "sweep", side_effect=paused_sweep):
+            try:
+                self.assertTrue(tasks.interrupt(task_id)["ok"])
+                await self.until(lambda: self.status(task_id) == "interrupted" and task_id not in tasks.live)
+                await self.until(entered.is_set, label="old sweep entered")
+                self.assertTrue(tasks.resume(task_id, "SLEEP 60 ECHO resumed-unique")["ok"])
+                tasks.schedule()
+                self.assertNotIn(task_id, tasks.live, "resume must wait for the old workspace sweep")
+                self.assertEqual(self.status(task_id), "queued")
+                self.assertEqual(self.store.one("SELECT COUNT(*) n FROM worker_runs WHERE task_id=?", task_id)["n"], 1)
+            finally:
+                release.set()
+                await self.until(swept.is_set, label="old sweep finished")
+            await self.until(lambda: task_id in tasks.live and tasks.live[task_id].ready
+                             and not tasks.live[task_id].pending_uuids, label="resume acknowledged")
+            new = tasks.live[task_id]
+            self.assertIsNot(new, old)
+            self.assertNotIn(new.process.proc.pid, killed)
+            self.assertIsNone(new.process.proc.returncode)
+            self.assertIn("resumed-unique", self.session_path(self.store.task(task_id)["session_id"]).read_text())
+            await tasks.stop(task_id)
+        self.assertIsNone(self.store.one("SELECT 1 FROM events WHERE task_id=? AND type='worker.retry'", task_id))
+
     async def test_pending_restart_waits_for_old_workspace_cleanup(self):
         import threading
         from unittest.mock import patch
@@ -1194,6 +1240,288 @@ class ProcessCleanup(unittest.IsolatedAsyncioTestCase):
         self.tasks = Tasks(SimpleNamespace(limits={"max_workers": 1}), self.store, None, None)
         self.task_id = self.store.add_task("task", "brief", "work", None, "session", "", "")
         self.addCleanup(self.store.close)
+
+    async def test_switch_model_handles_exit_callback_already_ready(self):
+        await self.ready_exit("switch", 0)
+
+    async def test_hold_handles_exit_callback_already_ready(self):
+        await self.ready_exit("hold", 0)
+
+    async def test_unexpected_ready_exit_still_fails_assignment(self):
+        for code in (0, 1):
+            with self.subTest(code=code):
+                await self.ready_exit("unexpected", code)
+
+    async def ready_exit(self, action, code):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from super_super_harness.workers.tasks import Run
+        self.tasks.cfg.limits["worker_retries"] = 0
+        self.tasks.cfg.profile = lambda name: SimpleNamespace(harness="fake")
+        self.tasks.on_change = AsyncMock()
+        self.tasks._launch = AsyncMock()
+        self.store.update_task(self.task_id, status="running", workspace="")
+        assignment = self.tasks._assign(self.task_id, "unfinished assignment")
+        self.store.run("UPDATE assignments SET status='doing' WHERE id=?", assignment)
+        run_id = self.store.run("INSERT INTO worker_runs(task_id,profile,session_id,started) VALUES(?,?,?,?)",
+                                self.task_id, "work", "session", time.time()).lastrowid
+        class Process:
+            def __init__(self):
+                self.closing = False
+                self.exited = asyncio.Event()
+            async def close(self):
+                self.closing = True
+                await self.exited.wait()
+        process = Process()
+        run = Run(process=process, ready=True, run_id=run_id, current_assignment=assignment,
+                  pending_uuids=set(), assignments={}, callers={})
+        self.tasks.live[self.task_id] = run
+        seen = []
+        async def exited():
+            process.exited.set()   # both adapters signal exit before calling the lifecycle callback
+            seen.append((run.ending, process.closing))
+            await self.tasks._on_exit(self.task_id, run, code)
+        callback = asyncio.create_task(exited())
+        # The reader is ready first; the control operation marks intent before its first yield.
+        if action == "switch":
+            response = await self.tasks.switch_model(self.task_id, "other")
+        elif action == "hold":
+            response = await self.tasks.hold(self.task_id)
+        await callback
+        await asyncio.sleep(0)   # allow the scheduled mock launch to run
+        expected = {"switch": "running", "hold": "interrupted", "unexpected": "failed"}[action]
+        self.assertEqual(seen, [(action != "unexpected", False)])
+        self.assertEqual(self.store.task(self.task_id)["status"], expected)
+        self.assertEqual(self.store.one("SELECT status FROM assignments WHERE id=?", assignment)["status"],
+                         "failed" if action == "unexpected" else "doing")
+        self.assertEqual(self.store.get("assignment_retries:%s" % assignment, "0"),
+                         "1" if action == "unexpected" else "0")
+        self.assertEqual(self.tasks._launch.await_count, int(action == "switch"))
+        recorded = self.store.one("SELECT ended,exit_code FROM worker_runs WHERE id=?", run_id)
+        self.assertIsNotNone(recorded["ended"])
+        self.assertEqual(recorded["exit_code"], code)
+        self.assertNotIn(self.task_id, self.tasks.cleaning)
+        if action != "unexpected":
+            self.assertEqual(response["status"], expected)
+            self.tasks.on_change.assert_not_awaited()
+        else:
+            self.tasks.on_change.assert_awaited_once()
+        if action == "hold":
+            self.assertIn(self.task_id, self.tasks.held)
+            self.tasks.release(self.task_id)
+
+    async def test_cleanup_registers_before_await_and_does_not_block_other_workers(self):
+        from unittest.mock import AsyncMock, patch
+        self.tasks._launch = AsyncMock()
+        self.store.update_task(self.task_id, status="completed", workspace="test-workspace")
+        with patch.object(procs, "sweep") as sweep:
+            cleanup = self.tasks._end_process(self.task_id)
+            try:
+                self.tasks.say(self.task_id, "new input")
+                self.assertNotIn(self.task_id, self.tasks.live)
+                other = self.store.add_task("other", "brief", "work", None, "session2", "", "")
+                self.tasks.schedule()
+                self.assertIn(other, self.tasks.live)
+                self.assertNotIn(self.task_id, self.tasks.live)
+            finally:
+                await cleanup
+        sweep.assert_called_once_with("test-workspace")
+        self.assertNotIn(self.task_id, self.tasks.cleaning)
+        self.tasks.live.pop(other)
+        self.tasks.schedule()
+        self.assertIn(self.task_id, self.tasks.live)
+
+    async def test_overlapping_cleanups_keep_barrier_until_last_sweep(self):
+        import threading
+        from unittest.mock import AsyncMock, patch
+        entered, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        def sweep(root):
+            if not entered.is_set():
+                loop.call_soon_threadsafe(entered.set)
+                if not release.wait(5):
+                    raise RuntimeError("fixture sweep barrier timed out")
+        self.tasks._launch = AsyncMock()
+        self.store.update_task(self.task_id, status="completed", workspace="test-workspace")
+        with patch.object(procs, "sweep", side_effect=sweep):
+            first = asyncio.create_task(self.tasks._end_process(self.task_id))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                await self.tasks._end_process(self.task_id)
+                self.assertEqual(self.tasks.cleaning[self.task_id], 1)
+                self.tasks.send(self.task_id, "queued while original sweep runs")
+                self.assertNotIn(self.task_id, self.tasks.live)
+            finally:
+                release.set()
+                await asyncio.wait_for(first, 2)
+        self.assertNotIn(self.task_id, self.tasks.cleaning)
+        self.assertIn(self.task_id, self.tasks.live)
+        self.assertEqual(json.loads(self.store.task(self.task_id)["pending"]), ["queued while original sweep runs"])
+
+    async def test_cancelled_cleanup_waiter_does_not_release_sweep_barrier(self):
+        import threading
+        from unittest.mock import AsyncMock, patch
+        for cancel_before_start in (False, True):
+            with self.subTest(cancel_before_start=cancel_before_start):
+                entered, launched, release = asyncio.Event(), asyncio.Event(), threading.Event()
+                loop = asyncio.get_running_loop()
+                def sweep(root):
+                    loop.call_soon_threadsafe(entered.set)
+                    if not release.wait(5):
+                        raise RuntimeError("fixture sweep barrier timed out")
+                self.tasks.live.clear()
+                self.tasks._launch = AsyncMock(side_effect=lambda *args: launched.set())
+                self.store.update_task(self.task_id, status="completed", workspace="test-workspace")
+                with patch.object(procs, "sweep", side_effect=sweep):
+                    waiter = asyncio.create_task(self.tasks._end_process(self.task_id))
+                    try:
+                        if not cancel_before_start:
+                            await asyncio.wait_for(entered.wait(), 2)
+                        waiter.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await waiter
+                        await asyncio.wait_for(entered.wait(), 2)
+                        self.tasks.say(self.task_id, "resume after cancelled waiter")
+                        self.assertNotIn(self.task_id, self.tasks.live)
+                        self.assertEqual(self.tasks.cleaning[self.task_id], 1)
+                    finally:
+                        release.set()
+                        await asyncio.wait_for(launched.wait(), 2)
+                self.assertNotIn(self.task_id, self.tasks.cleaning)
+                self.assertIn(self.task_id, self.tasks.live)
+
+    async def test_switch_commits_profile_before_cleanup_can_wake_followup(self):
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        entered, release, launched = asyncio.Event(), threading.Event(), asyncio.Event()
+        loop = asyncio.get_running_loop()
+        observed = []
+        self.tasks.cfg.profile = lambda name: SimpleNamespace(harness="fake")
+        self.store.update_task(self.task_id, status="completed", workspace="test-workspace")
+        async def launch(task_id, run):
+            observed.append(self.store.task(task_id)["profile"])
+            launched.set()
+        self.tasks._launch = launch
+        def sweep(root):
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(5):
+                raise RuntimeError("fixture sweep barrier timed out")
+        with patch.object(procs, "sweep", side_effect=sweep):
+            switch = asyncio.create_task(self.tasks.switch_model(self.task_id, "other"))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                self.tasks.say(self.task_id, "follow-up during model switch")
+                self.assertNotIn(self.task_id, self.tasks.live)
+            finally:
+                release.set()
+                result = await asyncio.wait_for(switch, 2)
+            await asyncio.wait_for(launched.wait(), 2)
+        self.assertEqual(observed, ["other"])
+        self.assertEqual(result["profile"], "other")
+        self.assertEqual(self.store.task(self.task_id)["profile"], "other")
+        self.assertNotIn(self.task_id, self.tasks.cleaning)
+
+    async def test_hold_waits_for_every_older_workspace_sweep(self):
+        import threading
+        from unittest.mock import patch
+        entered, own_done, release = asyncio.Event(), asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        self.store.update_task(self.task_id, status="completed", workspace="test-workspace")
+        self.tasks.system_prompt = lambda task_id: "fixture prompt"
+        end_process = self.tasks._end_process
+        def tracked_end(task_id):
+            cleanup = end_process(task_id)
+            async def finish():
+                await cleanup
+                own_done.set()
+            return finish()
+        def sweep(root):
+            if not entered.is_set():
+                loop.call_soon_threadsafe(entered.set)
+                if not release.wait(5):
+                    raise RuntimeError("fixture sweep barrier timed out")
+        with patch.object(procs, "sweep", side_effect=sweep):
+            first = asyncio.create_task(end_process(self.task_id))
+            hold = None
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                with patch.object(self.tasks, "_end_process", side_effect=tracked_end):
+                    hold = asyncio.create_task(self.tasks.hold(self.task_id))
+                    await asyncio.wait_for(own_done.wait(), 2)
+                    self.assertEqual(self.tasks.cleaning[self.task_id], 1)
+                    self.assertFalse(hold.done(), "interactive takeover must not overtake an older sweep")
+                    self.assertIn(self.task_id, self.tasks.held)
+            finally:
+                release.set()
+                await asyncio.wait_for(first, 2)
+                if hold:
+                    result = await asyncio.wait_for(hold, 2)
+        self.assertEqual(result["system_prompt"], "fixture prompt")
+        self.assertNotIn(self.task_id, self.tasks.cleaning)
+        self.assertIn(self.task_id, self.tasks.held)
+        self.tasks.release(self.task_id)
+
+    async def test_cancelled_hold_keeps_older_cleanup_admission_barrier(self):
+        await self.cancel_hold(cleanup_first=False)
+
+    async def test_cancelled_hold_reschedules_after_last_cleanup_has_finished(self):
+        await self.cancel_hold(cleanup_first=True)
+
+    async def cancel_hold(self, cleanup_first):
+        from unittest.mock import AsyncMock
+        self.tasks._end_process = AsyncMock()
+        self.tasks._launch = AsyncMock()
+        self.tasks.cleaning[self.task_id] = 1
+        self.store.update_task(self.task_id, status="completed")
+        hold = asyncio.create_task(self.tasks.hold(self.task_id))
+        await asyncio.sleep(0)   # hold reaches the older cleanup's event, not a timed delay
+        self.assertIn(self.task_id, self.tasks.cleanup_waiters)
+        self.tasks.say(self.task_id, "input during takeover")
+        if cleanup_first:
+            self.tasks._cleaned(self.task_id)   # wake hold, but cancel it before it can resume
+            self.assertNotIn(self.task_id, self.tasks.cleaning)
+        self.assertNotIn(self.task_id, self.tasks.live)
+        hold.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await hold
+        self.assertNotIn(self.task_id, self.tasks.held)
+        if not cleanup_first:
+            self.assertNotIn(self.task_id, self.tasks.live)
+            self.assertEqual(self.tasks.cleaning[self.task_id], 1)
+            self.tasks._cleaned(self.task_id)
+        self.assertIn(self.task_id, self.tasks.live)
+        self.assertNotIn(self.task_id, self.tasks.cleanup_waiters)
+
+    async def test_dormancy_waits_for_workspace_cleanup(self):
+        from unittest.mock import patch
+        self.tasks.cfg.limits.update(dormant_days=1, stall_minutes=30)
+        self.store.update_task(self.task_id, status="completed", workspace="test-workspace", last_active=0)
+        self.tasks.cleaning[self.task_id] = 1
+        with patch.object(workspace, "expire") as expire:
+            await self.tasks.tick()
+            expire.assert_not_called()
+            self.assertEqual(self.store.task(self.task_id)["status"], "completed")
+            self.tasks._cleaned(self.task_id)
+            await self.tasks.tick()
+            expire.assert_called_once()
+            self.assertEqual(self.store.task(self.task_id)["status"], "dormant")
+
+    async def test_recovery_keeps_pid_start_identity_check_before_workspace_sweep(self):
+        from unittest.mock import Mock, call, patch
+        self.tasks.schedule = Mock()
+        self.store.update_task(self.task_id, status="queued", workspace="test-workspace")
+        for pid, started in ((123, "original-start"), (456, "stale-start")):
+            self.store.run("INSERT INTO worker_runs(task_id,profile,session_id,pid,pid_started,started) VALUES(?,?,?,?,?,?)",
+                           self.task_id, "work", "session", pid, started, time.time())
+        with patch.object(procs, "alive", side_effect=[True, False]) as alive, \
+                patch.object(procs, "kill_tree") as kill, patch.object(procs, "sweep") as sweep:
+            await self.tasks.recover()
+        self.assertEqual(alive.call_args_list, [call(123, "original-start"), call(456, "stale-start")])
+        kill.assert_called_once_with(123)
+        sweep.assert_called_once_with("test-workspace")
+        self.assertIsNone(self.store.one("SELECT 1 FROM worker_runs WHERE ended IS NULL"))
+        self.tasks.schedule.assert_called_once_with()
 
     async def test_cleanup_queued_after_shutdown_does_not_read_closed_store(self):
         self.tasks.closed = True

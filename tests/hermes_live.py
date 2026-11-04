@@ -11,10 +11,12 @@ network sandbox: use an isolated host if all external traffic must be forbidden.
 The endpoint deterministically asks Hermes to run a local-only git push probe and report_done. It also checks cancel,
 cold resume/model selection, unknown-execution recovery and both auth headers.
 The private temporary home is retained with verification.json for inspection.
-This script has NOT been executed as part of the adapter's fixture acceptance.
+This script is excluded from ordinary fixture runs. Its pinned real-process
+checks passed on 2026-11-04 with CPython 3.14.7 and the acp,mcp,anthropic extras.
 """
 import argparse
 import asyncio
+from contextlib import closing
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -22,6 +24,8 @@ import os
 from pathlib import Path
 import secrets
 import shlex
+import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -61,11 +65,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(data)
                 return
+            names = [tool["name"] for tool in body.get("tools", []) if isinstance(tool.get("name"), str)]
             with self.server.lock:
                 phase = self.server.phase
                 step = self.server.plan.pop(0) if self.server.plan else ("text", "fixture complete")
                 self.server.observations.append({
-                    "phase": phase, "model": body.get("model"),
+                    "phase": phase, "model": body.get("model"), "tool_count": len(names),
+                    "router_tools": [name for name in names if name.startswith("mcp__router__")],
+                    "tool_search_bridge": "tool_search" in names,
                     "api_key_only": self.headers.get("x-api-key") == self.server.key and not self.headers.get("Authorization"),
                     "bearer_only": self.headers.get("Authorization") == "Bearer " + self.server.key and not self.headers.get("x-api-key"),
                     "system_prompt": SYSTEM_MARKER in json.dumps(body.get("system")),
@@ -138,7 +145,47 @@ else:
     return shlex.join([sys.executable, str(probe)])
 
 
-async def wait_until(predicate, timeout=60):
+def runtime_dependencies(binary, home):
+    """ACP's --check does not check the optional MCP or Anthropic SDKs."""
+    code = ("import importlib.util,json,sys; "
+            "print(json.dumps({'python':sys.version.split()[0], 'modules':"
+            "{name:importlib.util.find_spec(name) is not None for name in ('acp','mcp','anthropic')}}))")
+    env = {"HOME": str(home), "PATH": os.defpath, "HERMES_HOME": str(Path(home) / "dependency-check"),
+           "HERMES_RUNTIME_DIR": str(Path(home) / "runtime"), "HERMES_DISABLE_LAZY_INSTALLS": "1"}
+    try:
+        result = subprocess.run([str(Path(binary).resolve().parent / "python"), "-I", "-c", code], env=env,
+                                capture_output=True, text=True, timeout=20)
+        if result.returncode == 0:
+            parsed = json.loads(result.stdout)
+            if isinstance(parsed, dict) and isinstance(parsed.get("modules"), dict):
+                return parsed
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return {"python": "unknown", "modules": {name: False for name in ("acp", "mcp", "anthropic")}}
+
+
+def admission_states(path, session):
+    with closing(sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True)) as db:
+        return {row[0]: {"status": row[1], "outcome": row[2]} for row in db.execute(
+            "SELECT admission_id,status,outcome FROM session_admissions WHERE target_session_id=?", (session,))}
+
+
+def observe_loaded_unknown(process):
+    rpc = process._rpc
+    process.live_check_unknown_after_load = []
+    async def observed_rpc(method, **params):
+        result = await rpc(method, **params)
+        if method == "session/load":
+            # Replacement-owner startup turns lost started rows into unknown.
+            # Observe here, before the adapter's handshake resolves them.
+            process.live_check_unknown_after_load = await asyncio.to_thread(process._unknown)
+        return result
+    process._rpc = observed_rpc
+
+
+async def wait_until(predicate, timeout=180):
+    # Allow the default 120s handshake plus fixture execution; native interrupt
+    # still uses its explicit 8s deadline and cannot pass via the kill fallback.
     async def poll():
         while not predicate():
             await asyncio.sleep(.05)
@@ -177,6 +224,16 @@ async def exercise(args, home, report):
             await on_event(message)
         process = original_process(argv, env, cwd, event, on_exit, log_path=log_path)
         process.live_check_events = events
+        observe_loaded_unknown(process)
+        start = process.start
+        async def timed_start():
+            began = time.monotonic()
+            try:
+                return await start()
+            finally:
+                report.setdefault("launch_timings", []).append({"session": process.spec["sid"],
+                    "resume": process.spec["resume"], "seconds": round(time.monotonic() - began, 3)})
+        process.start = timed_start
         processes.append(process)
         return process
     command = local_probe(home)
@@ -202,9 +259,12 @@ async def exercise(args, home, report):
         thread = threading.Thread(target=endpoint.serve_forever, daemon=True)
         thread.start()
         with patch.dict(os.environ, SSHARNESS_HOME=str(home), SSHARNESS_LIVE_FIXTURE_KEY=key, SSHARNESS_NO_CAFFEINATE="1",
-                        HOME=str(os_home), SSH_AUTH_SOCK=""), \
+                        HOME=str(os_home), SSH_AUTH_SOCK="", PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"), \
                 patch.object(hermes, "Process", side_effect=record_process):
             report["phase"] = "installation"
+            report["runtime"] = runtime_dependencies(args.binary, os_home)
+            for name in ("acp", "mcp", "anthropic"):
+                mark(name + "_sdk", report["runtime"]["modules"].get(name) is True)
             mark("acp_dependencies", hermes.installation_check(cfg, cfg.profile("work"), timeout=20)[0])
             service = Service(cfg)
             end_process = service.tasks._end_process
@@ -282,16 +342,29 @@ async def exercise(args, home, report):
             process = service.tasks.live[task_id].process
             await process._remember_children()
             mark("gateway_descendants_observed", bool(process._children))
-            for pid, identity in list(process._children.items()):
-                if await asyncio.to_thread(procs.alive, pid, identity):
-                    await asyncio.to_thread(procs.kill_tree, pid)
-            await finished(task_id, ("failed", "interrupted"))
             hid = hermes._hermes_id(cfg, sid)
-            mark("unknown_admission_observed", bool(hermes_state.unknown(hermes.session_file(cfg, sid), hid)))
+            states = admission_states(hermes.session_file(cfg, sid), hid)
+            started_ids = [ident for ident, row in states.items() if row["status"] == "started"]
+            mark("crash_admission_started", len(started_ids) == 1)
+            lost = started_ids[0]
+            report["crash_admission"] = lost
+            owner = json.loads((Path(process.spec["home"]) / "gateway.pid").read_text())
+            pid = owner.get("pid")
+            mark("gateway_owner_observed", type(pid) is int and pid in process._children and
+                 owner.get("kind") == "hermes-gateway" and Path(owner.get("hermes_home", "")).resolve() == Path(process.spec["home"]).resolve())
+            mark("gateway_owner_alive", await asyncio.to_thread(procs.alive, pid, process._children[pid]))
+            # Kill the owner first: killing its tools first can let it settle the
+            # admission normally, which would not exercise uncertain execution.
+            os.kill(pid, signal.SIGKILL)
+            await finished(task_id, ("failed", "interrupted"))
             report_plan("recovery", "live recovered report")
             mark("recovery_requested", service.tasks.resume(task_id, "Recover the fixture; do not repeat the terminal probe.")["ok"])
             await finished(task_id)
+            recovered = next(p for p in reversed(processes) if p.spec["sid"] == sid)
+            mark("unknown_admission_observed", lost in recovered.live_check_unknown_after_load)
             mark("unknown_admission_discarded", not hermes_state.unknown(hermes.session_file(cfg, sid), hid))
+            mark("crash_admission_interrupted", admission_states(hermes.session_file(cfg, sid), hid).get(lost) ==
+                 {"status": "terminal", "outcome": "interrupted"})
             mark("recovery_report", service.store.task(task_id)["report"] == "live recovered report")
 
             report["phase"] = "bearer_auth"
@@ -300,6 +373,11 @@ async def exercise(args, home, report):
             await finished(bearer_id)
             api_rows = [row for row in endpoint.observations if row["phase"] != "bearer"]
             bearer_rows = [row for row in endpoint.observations if row["phase"] == "bearer"]
+            mark("router_tools_advertised", bool(endpoint.observations) and all(
+                "mcp__router__report_done" in row["router_tools"] for row in endpoint.observations))
+            timings = [row for row in report["launch_timings"] if row["session"] == sid]
+            report["cold_startup_seconds"] = next(row["seconds"] for row in timings if not row["resume"])
+            report["warm_startup_seconds"] = next(row["seconds"] for row in timings if row["resume"])
             mark("api_key_header", bool(api_rows) and all(row["api_key_only"] for row in api_rows))
             mark("bearer_header", bool(bearer_rows) and all(row["bearer_only"] for row in bearer_rows))
             mark("system_prompt", all(row["system_prompt"] for row in endpoint.observations))
@@ -359,7 +437,7 @@ def main():
         parser.error("--binary must be absolute")
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from super_super_harness.adapters import hermes, procs
-    hermes._check_install(args.binary, {})
+    args.binary = hermes._check_install(args.binary, {})
     source = next(p for p in Path(args.binary).resolve().parents if (p / "hermes_cli" / "main.py").is_file())
     revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], env=git_env(), text=True, timeout=5).strip()
     clean = subprocess.run(["git", "-C", str(source), "diff", "HEAD", "--quiet"], env=git_env(), capture_output=True, timeout=5)

@@ -316,6 +316,35 @@ def cmd_events(cfg, args):
     return 0
 
 
+def cmd_observations(cfg, args):
+    from .router.observations import listing, since_time
+    try:
+        since = since_time(args.since)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    rows = []
+    if cfg.db.exists():
+        with read_db(cfg) as db:
+            db.row_factory = sqlite3.Row
+            rows = listing(db, since, args.source, args.limit)
+    for row in rows:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row["created"]))
+        status = {"limited": "超额未观察", "queued": "待观察/尚无笔记", "noted": "已观察"}[row["status"]]
+        print("#%d %s [%s] %s  %s" % (row["event_id"], stamp, row["source"], status, row["text"]))
+        if row["url"]:
+            print("  " + row["url"])
+        if row["would_do"]:
+            print("  would_do: %s\n  route: %s" % (row["would_do"], row["route"]))
+        if row["used_builtin_tools"]:
+            print("  used_builtin_tools: " + ", ".join(row["builtin_tools"]))
+        if row["mixed_turn"]:
+            print("  mixed_turn: true (shared with ordinary input; tool use is not automatically a violation)")
+    if not rows:
+        print("No observations.")
+    return 0
+
+
 def show_events(db, task_id, after):
     last = after
     for row in db.execute("SELECT * FROM events WHERE task_id=? AND id>? ORDER BY id", (task_id, after)):
@@ -517,6 +546,10 @@ def main():
     emit.add_argument("--json", help="read the whole event from a JSON file, or - for stdin")
     events = commands.add_parser("events", help="list recent events and where they went, even with the service stopped")
     events.add_argument("--limit", type=int, default=20, help="number of events (default: 20)")
+    observations = commands.add_parser("observations", help="read observation notes, even with the service stopped")
+    observations.add_argument("--since", default="1d", help="look back by duration, e.g. 12h or 7d (default: 1d)")
+    observations.add_argument("--source", help="filter by source, e.g. github")
+    observations.add_argument("--limit", type=int, default=200)
     log = commands.add_parser("log", help="what a Worker did")
     log.add_argument("task", metavar="WORKER", help="code name (case-insensitive), internal id, or part of its name")
     log.add_argument("--full", action="store_true", help="everything the Harness recorded")
@@ -583,10 +616,11 @@ def main():
         if not 0 < args.limit <= 2 ** 63 - 1:
             parser.error("--limit must be between 1 and 9223372036854775807")
         return cmd_history(config.Paths(config.home_path()), args)
-    if args.command == "events":
+    if args.command in ("events", "observations"):
         if not 0 < args.limit <= 10000:
             parser.error("--limit must be between 1 and 10000")
-        return cmd_events(config.Paths(config.home_path()), args)
+        command = cmd_events if args.command == "events" else cmd_observations
+        return command(config.Paths(config.home_path()), args)
     if args.command == "emit":
         return cmd_emit(config.Paths(config.home_path()), args)
     if args.command in ("stop", "status"):
