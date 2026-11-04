@@ -19,8 +19,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from super_super_harness import chat, cli
-from super_super_harness.store import SCHEMA
+from super_super_harness.channels import chat
+from super_super_harness import cli
+from super_super_harness.core.store import SCHEMA
 
 ROOT = Path(__file__).resolve().parent.parent
 # Keep pre-web fixtures pre-web even when the current Store schema evolves.
@@ -139,7 +140,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(history.incoming({"text": "完成了？告警？", "kind": "answer"}).kind, "answer")
 
     def test_worker_titles_match_history_and_live_with_multiple_tasks(self):
-        from super_super_harness.store import Store
+        from super_super_harness.core.store import Store
         db = Store(self.path)
         self.addCleanup(db.close)
         history = self.history()
@@ -156,16 +157,16 @@ class HistoryTests(unittest.TestCase):
         display = chat.Display(io.StringIO(), False, False)
         display.message(live)
         live_text = display.output.getvalue()
-        self.assertIn("✓ 完成 · t1 Example 0", live_text)
-        self.assertIn("t3 Example 2", live_text)
+        self.assertIn("✓ Nova · Example 0", live_text)
+        self.assertIn("Echo · Example 2", live_text)
         self.assertIn("5", live_text)
-        self.assertNotIn("t4 Example 3", live_text)
+        self.assertNotIn("Atlas · Example 3", live_text)
         display.output = io.StringIO()
         display.message(saved)
         self.assertEqual(display.output.getvalue(), live_text)
 
     def test_worker_failed_and_question_titles_and_missing_task_fallback(self):
-        from super_super_harness.store import Store
+        from super_super_harness.core.store import Store
         db = Store(self.path)
         self.addCleanup(db.close)
         history = self.history()
@@ -179,12 +180,12 @@ class HistoryTests(unittest.TestCase):
                    "VALUES('router',?,'terminal','notice',?,?,?)", index, kind, turn, index)
             display = chat.Display(io.StringIO(), False, False)
             display.message(history.incoming({"text": kind}))
-            self.assertIn(label + " · t1 Neutral task", display.output.getvalue())
+            self.assertIn(label + " Nova · Neutral task", display.output.getvalue())
         db.run("DELETE FROM tasks")
         self.assertTrue(history.recent())  # Missing names must not break old history.
 
     def test_worker_titles_respect_message_kind_and_group_latest_events(self):
-        from super_super_harness.store import Store
+        from super_super_harness.core.store import Store
         from tests.notification_helpers import CASES, populate
         db = Store(self.path)
         self.addCleanup(db.close)
@@ -195,7 +196,7 @@ class HistoryTests(unittest.TestCase):
                 self.service_reply(db, name, kind, turn)
                 live = history.incoming({'text': name, 'kind': kind})
                 saved = history.recent()[-1]
-                self.assertEqual((live.kind, live.title), (expected_kind, title.format(*ids)))
+                self.assertEqual((live.kind, live.title), (expected_kind, title.format(*(db.task(task_id)["code_name"] for task_id in ids))))
                 display = chat.Display(io.StringIO(), False, False)
                 display.message(live)
                 live_text = display.output.getvalue()
@@ -217,7 +218,7 @@ class HistoryTests(unittest.TestCase):
 
 class HistoryCommandTests(unittest.TestCase):
     def setUp(self):
-        from super_super_harness import config
+        from super_super_harness.ops import config
         self.temporary = tempfile.TemporaryDirectory(prefix="ssharness-history-")
         self.addCleanup(self.temporary.cleanup)
         self.home = Path(self.temporary.name)
@@ -229,7 +230,7 @@ class HistoryCommandTests(unittest.TestCase):
         with patch.dict(os.environ, SSHARNESS_HOME=str(self.home)), \
                 patch("sys.argv", ["supersuperharness", "history", *args]), \
                 patch("super_super_harness.cli.config.load", side_effect=AssertionError("history needs only paths")), \
-                patch("super_super_harness.store.Store", side_effect=AssertionError("history must not migrate")), \
+                patch("super_super_harness.core.store.Store", side_effect=AssertionError("history must not migrate")), \
                 patch("super_super_harness.cli.Client", side_effect=AssertionError("history must work offline")), \
                 redirect_stdout(output), redirect_stderr(errors):
             result = cli.main()
@@ -265,7 +266,7 @@ class HistoryCommandTests(unittest.TestCase):
                     with self.assertRaises(sqlite3.OperationalError):
                         result.db.execute("CREATE TABLE forbidden(x)")
                     return result
-                with patch("super_super_harness.chat.CommandHistory", side_effect=history):
+                with patch("super_super_harness.channels.chat.CommandHistory", side_effect=history):
                     result, output, errors = self.command()
                 self.assertEqual(result, 0, errors)
                 self.assertEqual(len(opened), 1)
@@ -942,7 +943,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(session.process.wait(timeout=3), 0)
 
     def test_stop_and_status_work_without_valid_profile_configuration(self):
-        from super_super_harness.store import Store
+        from super_super_harness.core.store import Store
         Store(self.home / "router.db").close()
         profile = self.home / "profiles.toml"
         profile.unlink()

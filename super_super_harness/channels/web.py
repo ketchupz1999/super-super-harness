@@ -21,13 +21,12 @@ import time
 from urllib.parse import parse_qs, urlsplit
 
 from . import usage
-from .adapters import get_harness, session_harness
+from ..adapters import get_harness, session_harness
 from .avatar import Avatar, EXTENSIONS as AVATAR_EXTENSIONS, STATES as AVATAR_STATES
-from .config import REPO_ROOT, expand
-from .private_files import persistent_secret
+from ..ops.config import REPO_ROOT, expand
+from ..core.private_files import persistent_secret
 from .notifications import worker_notice
-from .router_files import DocumentError
-from .worker_names import worker_name
+from ..core.router_files import DocumentError
 
 BODY_LIMIT = 64 * 1024
 HEADER_LIMIT = 16 * 1024
@@ -37,7 +36,7 @@ TRANSCRIPT_ITEMS = 500
 TEXT_LIMIT = 16000
 USAGE_CACHE_SECONDS = 3
 USAGE_CACHE_WINDOWS = 4
-STATES = ("waiting", "running", "queued", "waiting_deps", "interrupted", "completed", "failed", "stopped")
+STATES = ("waiting", "running", "queued", "waiting_deps", "interrupted", "completed", "dormant", "failed", "stopped")
 ITEMS_LIMIT = 200
 COOKIE = "ssharness_web_session"
 CHARACTER_ID = re.compile(r"[a-z][a-z0-9-]{0,31}")
@@ -461,13 +460,20 @@ class Web:
                 "last_event": router.last_event, "pid": router.process.pid if router.process else None,
                 "avatar": self.router_avatar.state(), "question": self.router_question()}
 
+    def resolve_worker(self, worker):
+        return self.store.one("SELECT * FROM tasks WHERE code_name=? COLLATE NOCASE", worker) or self.store.task(worker)
+
     def task_links(self):
         """Item and upstreams of every task, for the page's run view."""
         items = {row["task_id"]: row["item"] for row in self.store.all("SELECT task_id, item FROM item_tasks")}
         deps = {}
-        for row in self.store.all("SELECT d.task_id, d.upstream, d.satisfied FROM task_deps d LEFT JOIN tasks t ON t.id=d.upstream ORDER BY t.seq"):
-            deps.setdefault(row["task_id"], []).append({"task_id": row["upstream"], "satisfied": row["satisfied"] is not None})
-        return items, deps, self.task_activity()
+        for row in self.store.all("SELECT d.task_id, d.upstream, d.satisfied, t.code_name, t.name, t.role FROM task_deps d LEFT JOIN tasks t ON t.id=d.upstream ORDER BY t.seq"):
+            deps.setdefault(row["task_id"], []).append({"task_id": row["upstream"], "satisfied": row["satisfied"] is not None,
+                                                      "code_name": row["code_name"], "name": row["name"], "role": row["role"]})
+        assignments = {row["task_id"]: row["text"] for row in self.store.all(
+            "SELECT a.task_id, substr(a.text,1,200) text FROM assignments a JOIN "
+            "(SELECT task_id, MAX(id) id FROM assignments GROUP BY task_id) last ON last.id=a.id")}
+        return items, deps, self.task_activity(), assignments
 
     def task_activity(self):
         """Read-only display hints: current run start, the Worker's own words, last tool and last exchange."""
@@ -510,15 +516,15 @@ class Web:
     def task_summary(self, row, links=None):
         task = dict(row)
         profile = self.cfg.profiles.get(task["profile"])
-        items, deps, activity = links or self.task_links()
+        items, deps, activity, assignments = links or self.task_links()
         asked = self.store.one("SELECT id, question, options FROM questions WHERE task_id=? ORDER BY id DESC LIMIT 1", task["id"]) \
             if task["status"] == "waiting" and task["question"] else None
         if asked and asked["question"] != task["question"]:
             asked = None
         options = json.loads(asked["options"]) if asked else []
-        return {key: task[key] for key in ("id", "name", "status", "profile", "repo", "branch", "created", "updated",
+        return {key: task[key] for key in ("id", "code_name", "role", "name", "status", "profile", "repo", "branch", "created", "updated",
                                           "started", "state_since", "ended")} | {
-            "worker_name": worker_name(task["seq"]),
+            "worker_name": task["code_name"], "assignment": assignments.get(task["id"], ""),
             "model": profile.model if profile else task["profile"] + " (profile removed)",
             "harness": self.store.get("task_harness:" + task["id"]) or (profile.harness if profile else ""),
             "where": Path(task["repo"]).name if task["repo"] else "Workspace",
@@ -550,9 +556,9 @@ class Web:
     def state(self):
         counts = dict.fromkeys(STATES, 0)
         counts.update({r["status"]: r["n"] for r in self.store.all("SELECT status, COUNT(*) n FROM tasks GROUP BY status")})
-        rows = self.store.all("SELECT seq, id, name, status, profile, repo, branch, created, updated, started, state_since, ended, "
+        rows = self.store.all("SELECT seq, id, code_name, role, name, status, profile, repo, branch, created, updated, started, state_since, ended,"
                               "substr(progress,1,2000) progress, substr(question,1,16000) question FROM tasks "
-                              "ORDER BY status IN ('completed','failed','stopped'), seq DESC LIMIT 1000")
+                              "ORDER BY status IN ('completed','dormant','failed','stopped'), seq DESC LIMIT 1000")
         links = self.task_links()
         items, items_truncated = self.items()
         return {"reminders": self.service.reminders.list(), "router": self.router_state(), "tasks": [self.task_summary(t, links) for t in rows], "counts": counts,
@@ -622,17 +628,27 @@ class Web:
                 matched = outcomes.get(data.get("call_key"), []) if event["type"] == "tool" else []
                 succeeded = matched.pop(0) if matched else False
                 tool = name.removeprefix("mcp__router__")
-                success_type = {"task_start": "task.started", "task_send": "task.message", "item_create": "item.created", "item_update": "item.updated"}.get(tool)
+                success_type = {"worker_hire": "task.started", "worker_assign": "task.message", "worker_say": "task.message",
+                                "task_start": "task.started", "task_send": "task.message",
+                                "item_create": "item.created", "item_update": "item.updated"}.get(tool)
                 replacement = bool(snapshots) if tool == "reminder_add" else any(e["type"] == success_type for e in events[:100])
                 step["hidden"] = tool == "reply" or (succeeded and replacement)
                 steps.append(step)
-                # Tool events carry task_send/interrupt ids in their serialized input.
-                try:
-                    inp = json.loads(data.get("input", "{}"))
-                    if isinstance(inp, dict) and re.fullmatch(r"t[0-9]+", str(inp.get("task_id", ""))):
-                        linked.add(inp["task_id"])
-                except (ValueError, TypeError):
-                    pass
+                # Persisted tool targets survive renames; only older events need name lookup.
+                target = None
+                if isinstance(data.get("task_id"), str):
+                    target = self.store.task(data["task_id"])
+                else:
+                    try:
+                        inp = json.loads(data.get("input", "{}"))
+                        worker = inp.get("worker", inp.get("task_id", "")) if isinstance(inp, dict) else ""
+                        if isinstance(worker, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,23}", worker):
+                            target = self.resolve_worker(worker)
+                    except (ValueError, TypeError):
+                        pass
+                if target:
+                    linked.add(target["id"])
+                    step["task_id"] = target["id"]
             kind, title = worker_notice(self.store.db, row["kind"], turn_id, row["source_id"]) if row["role"] == "router" else (row["kind"], "")
             asked = self.store.one("SELECT options FROM questions WHERE outbox_id=?", row["source_id"]) \
                 if row["role"] == "router" and row["kind"] == "question" else None
@@ -649,11 +665,11 @@ class Web:
         """Read both directions, including dependencies outside the bounded state list."""
         result = {}
         for name, owner, peer in (("upstream", "task_id", "upstream"), ("downstream", "upstream", "task_id")):
-            rows = self.store.all("SELECT d.%s id, t.seq, t.name, t.status, d.satisfied FROM task_deps d "
+            rows = self.store.all("SELECT d.%s id, t.seq, t.code_name, t.role, t.name, t.status, d.satisfied FROM task_deps d "
                                   "LEFT JOIN tasks t ON t.id=d.%s WHERE d.%s=? ORDER BY t.seq, d.%s" %
                                   (peer, peer, owner, peer), task_id)
             result[name] = [{"id": row["id"], "name": row["name"], "status": row["status"],
-                             "worker_name": worker_name(row["seq"]) if row["seq"] else row["id"],
+                             "code_name": row["code_name"], "role": row["role"], "worker_name": row["code_name"],
                              "satisfied": row["satisfied"] is not None} for row in rows]
         return result
 
@@ -907,11 +923,16 @@ class Web:
                 message_id = self.service.router.submit("user", text, "web")
                 self.store.run("INSERT INTO web_requests(key, message_id) VALUES(?,?)", key, message_id)
             return {"id": message_id}
-        match = re.fullmatch(r"/api/tasks/(t[0-9]+)(?:/(send|interrupt|resume|stop|model|diff))?", path)
+        match = re.fullmatch(r"/api/workers/([A-Za-z][A-Za-z0-9-]{0,23})(?:/(send|interrupt|resume|stop|model|diff))?", path)
         if match:
-            task_id, action = match.groups()
-            if not self.store.task(task_id):
-                raise HTTPError(404, "no such task")
+            worker, action = match.groups()
+            # Browser graph keys are immutable ids, which can also be legal code names.
+            if "by" in query and query["by"] != ["id"]:
+                raise HTTPError(400, "invalid Worker selector")
+            task = self.store.task(worker) if query.get("by") == ["id"] else self.resolve_worker(worker)
+            if not task:
+                raise HTTPError(404, "no such Worker")
+            task_id = task["id"]
             if method == "GET" and not action:
                 return await self.detail(task_id, query)
             if method == "GET" and action == "diff":
@@ -919,7 +940,7 @@ class Web:
             if method == "POST":
                 tasks = self.service.tasks
                 if action == "send":
-                    result = tasks.send(task_id, text_field(data, "text"), text_field(data, "expected_status", False))
+                    result = tasks.send(task_id, text_field(data, "text"), text_field(data, "expected_status", False), source="you")
                 elif action == "interrupt":
                     result = tasks.interrupt(task_id)
                 elif action == "resume":

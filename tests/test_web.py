@@ -16,10 +16,10 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
-from super_super_harness import config
-from super_super_harness.store import Store
-from super_super_harness.web import BODY_LIMIT, DIFF_LIMIT, TRANSCRIPT_BYTES
-from tests.support import ServiceCase, free_port
+from super_super_harness.ops import config
+from super_super_harness.core.store import Store
+from super_super_harness.channels.web import BODY_LIMIT, DIFF_LIMIT, TRANSCRIPT_BYTES
+from tests.support import PAGE, ServiceCase, free_port
 
 
 class OfflineWebCommandTests(unittest.TestCase):
@@ -67,6 +67,56 @@ class OfflineWebCommandTests(unittest.TestCase):
                 self.assertIn("后台服务没有运行", result.stdout + result.stderr)
                 self.assertNotIn("Traceback", result.stdout + result.stderr)
                 self.assertNotIn("fake-owner-token", result.stdout + result.stderr)
+
+
+class WorkerCLIEntries(unittest.TestCase):
+    def test_lookup_output_and_internal_rpc_targets(self):
+        from types import SimpleNamespace
+        from super_super_harness import cli
+        from super_super_harness.ops.config import Paths
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = Paths(Path(folder))
+            store = Store(cfg.db)
+            self.addCleanup(store.db.close)
+            tid = store.add_task('Review pages', 'brief', 'work', None, 'session', '', '', code_name='Gate', role='Entries')
+            store.update_task(tid, status='dormant', progress='Ready')
+            for needle in ('Gate', 'gAtE', tid, 'pages'):
+                self.assertEqual(cli.find_task(store.db, needle)['id'], tid)
+            other = store.add_task('Review API', 'brief', 'work', None, 'other', '', '', code_name='Pixel')
+            with self.assertRaises(SystemExit) as ambiguous:
+                cli.find_task(store.db, 'Review')
+            self.assertIn('Gate Review pages', str(ambiguous.exception))
+            self.assertIn('Pixel Review API', str(ambiguous.exception))
+            self.assertNotIn(tid + ' ', str(ambiguous.exception))
+            with self.assertRaisesRegex(SystemExit, 'no Worker matches'):
+                cli.find_task(store.db, 'missing')
+            with patch.object(cli, 'Client', side_effect=OSError), redirect_stdout(io.StringIO()) as output:
+                cli.cmd_status(cfg, SimpleNamespace())
+            self.assertRegex(output.getvalue(), r'Gate\s+休眠\s+work\s+Review pages\s+Ready')
+            with redirect_stdout(io.StringIO()) as output:
+                cli.cmd_log(cfg, SimpleNamespace(task='gate', full=False, follow=False))
+            self.assertTrue(output.getvalue().startswith('Gate Review pages'))
+            cfg.profile = lambda name: None
+            with patch.object(cli, 'Client') as client, patch.object(cli, 'exec_interactive', return_value=0) as interactive, redirect_stdout(io.StringIO()) as output:
+                client.return_value.call.return_value = dict(store.task(tid), cwd=folder, system_prompt='')
+                self.assertEqual(cli.cmd_open(cfg, SimpleNamespace(task='gate')), 0)
+            self.assertEqual(client.return_value.call.call_args_list[0].kwargs, {'task_id': tid})
+            self.assertEqual(client.return_value.call.call_args_list[1].kwargs, {'task_id': tid})
+            self.assertIn('Gate 已交还', output.getvalue())
+            interactive.assert_called_once()
+            store.update_task(other, code_name=tid)
+            self.assertEqual(cli.find_task(store.db, tid)['id'], other, 'An exact public code name has priority')
+
+    def test_help_names_worker_argument(self):
+        from super_super_harness import cli
+        import sys
+        for command in ('log', 'open'):
+            with patch.object(sys, 'argv', ['supersuperharness', command, '--help']), redirect_stdout(io.StringIO()) as output:
+                with self.assertRaises(SystemExit) as result:
+                    cli.main()
+            self.assertEqual(result.exception.code, 0)
+            self.assertIn('WORKER', output.getvalue())
+            self.assertNotIn('TASK', output.getvalue())
 
 
 class WebCase(ServiceCase):
@@ -424,7 +474,7 @@ class WebCase(ServiceCase):
         self.assertTrue(all(r['tokens'] is None for r in body['tasks']))
 
     async def test_usage_read_caps_and_unsupported_harness_do_not_read_transcripts(self):
-        from super_super_harness import usage
+        from super_super_harness.channels import usage
         self.usage_task([self.usage_row(), self.usage_row('extra')])
         self.usage_task([self.usage_row('b')], 'usage-worker-b')
         for field, value in (('SESSION_LIMIT', 1), ('TOTAL_BYTES', 10), ('ROW_LIMIT', 1), ('DIRECTORY_LIMIT', 0)):
@@ -458,7 +508,7 @@ class WebCase(ServiceCase):
         self.assertEqual(body['summary']['tokens'], 20)
 
     async def test_usage_inaccessible_candidate_preserves_unknown_instead_of_500(self):
-        from super_super_harness import usage
+        from super_super_harness.channels import usage
         self.usage_task([self.usage_row()])
         (self.cfg.session_root / 'denied-project').mkdir()
         original = os.open
@@ -473,7 +523,7 @@ class WebCase(ServiceCase):
         self.assertIsNone(body['tasks'][0]['tokens'])
 
     async def test_usage_shared_cache_uses_one_readonly_background_scan(self):
-        from super_super_harness import usage
+        from super_super_harness.channels import usage
         import threading
         self.usage_task([self.usage_row()])
         self.store.unset('router_session')
@@ -502,7 +552,7 @@ class WebCase(ServiceCase):
         self.store.run("UPDATE messages SET status='done'")
         self.assertEqual((await self.request())[2]['router']['pending'], 0)
 
-    async def test_worker_event_titles_use_task_ids_and_names(self):
+    async def test_worker_event_titles_use_code_names(self):
         self.service.router.mode = "paused"
         turn = self.store.open_turn()
         ids = [self.store.add_task("Neutral <task> %d" % i, "brief", "work", None, "s", "", "") for i in range(5)]
@@ -512,11 +562,11 @@ class WebCase(ServiceCase):
         self.service.router.reply("Done")
         _, _, body = await self.request(path="/api/conversation")
         row = body["items"][-1]
-        self.assertIn("✓ 完成 · t1 Neutral <task> 0", row.get("title", ""))
-        self.assertIn("t3 Neutral <task> 2", row["title"])
+        self.assertIn("✓ Nova · Neutral <task> 0", row.get("title", ""))
+        self.assertIn("Echo · Neutral <task> 2", row["title"])
         self.assertIn("5", row["title"])
-        self.assertNotIn("t4 Neutral", row["title"])
-        self.assertEqual(row["title"].count("t1 Neutral"), 1)
+        self.assertNotIn("Atlas · Neutral", row["title"])
+        self.assertEqual(row["title"].count("Nova · Neutral"), 1)
         # The same metadata is returned on live reconciliation, not just history.
         _, _, live = await self.request(path="/api/conversation?after=0")
         self.assertEqual(live["items"][-1]["title"], row["title"])
@@ -524,7 +574,7 @@ class WebCase(ServiceCase):
             self.store.run("UPDATE messages SET kind=?", kind)
             self.service.router.reply('Updated ' + kind)
             _, _, body = await self.request(path="/api/conversation")
-            self.assertIn(label + " · t1 Neutral", body["items"][-1]["title"])
+            self.assertIn(label + " Nova · Neutral", body["items"][-1]["title"])
         self.store.run("DELETE FROM tasks")
         self.service.router.reply('Missing task names')
         status, _, body = await self.request(path="/api/conversation")
@@ -538,14 +588,14 @@ class WebCase(ServiceCase):
                 turn, ids = populate(self.store, events)
                 self.service.router.reply(name, kind)
                 live = (await self.request(path='/api/conversation?after=0'))[2]['items'][-1]
-                self.assertEqual((live['kind'], live['title']), (expected_kind, title.format(*ids)))
+                self.assertEqual((live['kind'], live['title']), (expected_kind, title.format(*(self.worker_name(task_id) for task_id in ids))))
                 self.store.run("UPDATE messages SET status='done' WHERE turn_id=?", turn)
                 self.store.run("UPDATE turns SET status='done' WHERE id=?", turn)
                 saved = (await self.request(path='/api/conversation'))[2]['items'][-1]
                 self.assertEqual((saved['kind'], saved['title']), (live['kind'], live['title']))
 
     async def worker_rollover(self, terminal):
-        from super_super_harness.chat import Display, History
+        from super_super_harness.channels.chat import Display, History
         from unittest.mock import Mock
         router = self.service.router
         self.say('SLEEP 0.8 ECHO initial')
@@ -569,7 +619,7 @@ class WebCase(ServiceCase):
             live = (await self.request(path='/api/conversation?after=0'))[2]['items'][-1]
             before = (live['kind'], live['title'])
         await self.until(lambda: self.store.one('SELECT turn_id FROM messages WHERE id=?', unread)['turn_id'] != old_turn)
-        self.assertEqual(before, ('worker.done', '✓ 完成 · %s Read task' % read_task))
+        self.assertEqual(before, ('worker.done', '✓ %s · Read task' % self.worker_name(read_task)))
         if terminal:
             saved = history.recent()[-1]
             self.assertEqual((saved.kind, saved.title), before)
@@ -589,16 +639,16 @@ class WebCase(ServiceCase):
         if terminal:
             next_live = history.incoming({'text': 'Second notification', 'kind': 'notice'})
             self.assertEqual((next_live.kind, next_live.title),
-                             ('worker.failed', '! 告警 · %s Unread task' % unread_task))
+                             ('worker.failed', '! 告警 %s · Unread task' % self.worker_name(unread_task)))
             self.assertEqual(history.recent()[-1].title, next_live.title)
         else:
             next_live = (await self.request(path='/api/conversation?after=0'))[2]['items'][-1]
             self.assertEqual((next_live['kind'], next_live['title']),
-                             ('worker.failed', '! 告警 · %s Unread task' % unread_task))
+                             ('worker.failed', '! 告警 %s · Unread task' % self.worker_name(unread_task)))
             self.assertEqual((await self.request(path='/api/conversation'))[2]['items'][-1]['title'], next_live['title'])
 
     async def worker_late_confirmation(self, terminal, empty=False):
-        from super_super_harness.chat import History
+        from super_super_harness.channels.chat import History
         from tests.notification_helpers import populate
         self.service.router.mode = 'paused'
         turn, ids = populate(self.store, [(0, 'worker.done'), (1, 'worker.failed')])
@@ -615,9 +665,9 @@ class WebCase(ServiceCase):
         else:
             live = (await self.request(path='/api/conversation?after=0'))[2]['items'][-1]
             before = (live['kind'], live['title'])
-        expected = ('notice', '') if empty else ('worker.done', '✓ 完成 · %s X' % ids[0])
+        expected = ('notice', '') if empty else ('worker.done', '✓ %s · X' % self.worker_name(ids[0]))
         self.assertEqual(before, expected)
-        after_title = '! 告警 · %s Y' % ids[1] + ('' if empty else '；✓ 完成 · %s X' % ids[0])
+        after_title = '! 告警 %s · Y' % self.worker_name(ids[1]) + ('' if empty else '；✓ %s · X' % self.worker_name(ids[0]))
         await self.service.router._on_event({'type': 'user', 'isReplay': True, 'uuid': unread['uuid']})
         self.service.router.reply('After late replay', 'notice')
         if terminal:
@@ -711,7 +761,7 @@ class WebCase(ServiceCase):
         self.assertFalse(token_file.exists())
         self.assertEqual((await self.request(path="/?" + urlsplit(stale_url).query))[0], 401)
         # Disabled web instances also remove the obsolete file, without following symlinks.
-        from super_super_harness.web import Web
+        from super_super_harness.channels.web import Web
         self.cfg.web["port"] = 0
         target = self.home / "keep"
         target.write_text("do not change")
@@ -744,7 +794,7 @@ class WebCase(ServiceCase):
         self.assertEqual(errors, [])
 
     async def test_shutdown_closes_accepted_connection_before_handler_registration(self):
-        from super_super_harness.web import Web
+        from super_super_harness.channels.web import Web
         from dataclasses import replace
         from types import SimpleNamespace
         cfg = replace(self.cfg, web=dict(self.cfg.web, port=free_port()))
@@ -805,9 +855,9 @@ class WebCase(ServiceCase):
             self.assertEqual(code, 403)
             self.assertNotIn("Access-Control-Allow-Origin", headers)
         self.assertEqual((await self.request("OPTIONS"))[0], 405)
-        for path in ["/api/tasks/../owner-token", "/api/tasks/%2e%2e/diff", "/api/tasks/t1%2fsend", "/api/tasks/t1\\send"]:
+        for path in ["/api/workers/../owner-token", "/api/workers/%2e%2e/diff", "/api/workers/t1%2fsend", "/api/workers/t1\\send"]:
             self.assertEqual((await self.request(path=path))[0], 400)
-        self.assertEqual((await self.request(path="/api/tasks/t999"))[0], 404)
+        self.assertEqual((await self.request(path="/api/workers/t999"))[0], 404)
         self.assertEqual((await self.request(path="/owner-token"))[0], 404)
         self.assertEqual((await self.request("POST", "/api/messages", [], {}))[0], 400)
         self.assertEqual((await self.request("POST", "/api/messages", {}, {"Content-Type": "text/plain"}))[0], 415)
@@ -854,14 +904,14 @@ class WebCase(ServiceCase):
     async def test_history_turn_tools_and_task_links(self):
         self.service.router.submit("user", "SLEEP 1 ECHO x", "web")
         await self.until(lambda: self.store.current_turn())
-        task = await self.tool("task_start", name="test", brief="SLEEP 3")
+        task = await self.tool("worker_hire", name="test", brief="SLEEP 3")
         await self.service.router._on_event({"type": "assistant", "message": {"content": [
-            {"type": "tool_use", "id": "a", "name": "mcp__router__task_send", "input": {"task_id": task["task_id"], "text": "hello"}}]}})
+            {"type": "tool_use", "id": "a", "name": "mcp__router__worker_assign", "input": {"worker": task["worker"], "text": "hello"}}]}})
         await self.tool("reply", text="task started")
         history = (await self.request(path="/api/conversation"))[2]["items"]
         reply = [m for m in history if m["role"] == "router"][0]
-        self.assertIn(task["task_id"], reply["tasks"])
-        self.assertTrue(any(s["name"] == "mcp__router__task_send" for s in reply["steps"]))
+        self.assertIn(self.worker_id(task), reply["tasks"])
+        self.assertTrue(any(s["name"] == "mcp__router__worker_assign" for s in reply["steps"]))
 
     async def test_web_delivery_does_not_consume_terminal_backlog(self):
         self.service.outbox.add("broadcast", "notice")
@@ -914,20 +964,20 @@ class WebCase(ServiceCase):
         state = (await self.request())[2]
         self.assertEqual(state["counts"]["running"], 1)
         self.assertEqual(state["tasks"][0]["id"], task)
-        self.assertEqual((await self.request("POST", "/api/tasks/%s/interrupt" % task, {}))[0], 200)
+        self.assertEqual((await self.request("POST", "/api/workers/%s/interrupt" % task, {}))[0], 200)
         await self.wait_status(task, "interrupted")
         await self.until(lambda: task not in self.service.tasks.live)
-        self.assertEqual((await self.request("POST", "/api/tasks/%s/resume" % task, {"text": "SLEEP 10"}))[0], 200)
+        self.assertEqual((await self.request("POST", "/api/workers/%s/resume" % task, {"text": "SLEEP 10"}))[0], 200)
         await self.worker_ready(task)
-        self.assertEqual((await self.request("POST", "/api/tasks/%s/model" % task, {"profile": "other"}))[0], 200)
+        self.assertEqual((await self.request("POST", "/api/workers/%s/model" % task, {"profile": "other"}))[0], 200)
         self.assertEqual(self.store.task(task)["profile"], "other")
-        self.assertEqual((await self.request("POST", "/api/tasks/%s/model" % task, {"profile": "missing"}))[0], 400)
-        self.assertEqual((await self.request("POST", "/api/tasks/%s/send" % task, {"text": "hello", "expected_status": "waiting"}))[0], 409)
+        self.assertEqual((await self.request("POST", "/api/workers/%s/model" % task, {"profile": "missing"}))[0], 400)
+        self.assertEqual((await self.request("POST", "/api/workers/%s/send" % task, {"text": "hello", "expected_status": "waiting"}))[0], 409)
         await self.until(lambda: task in self.service.tasks.live and self.service.tasks.live[task].process)
-        self.assertEqual((await self.request("POST", "/api/tasks/%s/send" % task, {"text": "hello"}))[0], 200)
-        self.assertEqual((await self.request("POST", "/api/tasks/%s/stop" % task, {}))[0], 200)
+        self.assertEqual((await self.request("POST", "/api/workers/%s/send" % task, {"text": "hello"}))[0], 200)
+        self.assertEqual((await self.request("POST", "/api/workers/%s/stop" % task, {}))[0], 200)
         self.assertEqual(self.status(task), "stopped")
-        self.assertEqual((await self.request("POST", "/api/tasks/%s/send" % task, {"text": "no"}))[0], 409)
+        self.assertEqual((await self.request("POST", "/api/workers/%s/send" % task, {"text": "no"}))[0], 409)
 
     async def test_waiting_clock_and_finished_duration(self):
         task = self.start_task("SLEEP 10")
@@ -936,7 +986,7 @@ class WebCase(ServiceCase):
         waiting = self.store.task(task)["state_since"]
         self.service.tasks.report_progress(task, "still waiting")
         self.assertEqual(self.store.task(task)["state_since"], waiting)
-        info = (await self.request(path="/api/tasks/%s" % task))[2]
+        info = (await self.request(path="/api/workers/%s" % task))[2]
         self.assertEqual(info["task"]["state_since"], waiting)
         self.assertGreaterEqual(waiting, info["task"]["started"])
         await self.service.tasks.stop(task)
@@ -946,7 +996,7 @@ class WebCase(ServiceCase):
     async def test_transcript_pagination_limits_and_event_fallback(self):
         self.service.tasks.closed = True
         task = self.start_task("brief")
-        detail = (await self.request(path="/api/tasks/%s" % task))[2]
+        detail = (await self.request(path="/api/workers/%s" % task))[2]
         self.assertEqual(detail["source"], "events")
         path = self.session_path(self.store.task(task)["session_id"])
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -956,12 +1006,12 @@ class WebCase(ServiceCase):
                 file.write(json.dumps({"type": "assistant", "timestamp": "2026-11-01T00:00:00Z", "message": {"content": [
                     {"type": "thinking", "thinking": "step %d" % i},
                     {"type": "text", "text": '<script>alert("x")</script>'}]}}) + '\n')
-        detail = (await self.request(path="/api/tasks/%s?limit=20" % task))[2]
+        detail = (await self.request(path="/api/workers/%s?limit=20" % task))[2]
         self.assertEqual(detail["source"], "transcript")
         self.assertTrue(detail["truncated"])
         self.assertEqual(len(detail["timeline"]), 20)
         self.assertEqual(detail["next_offset"], 20)
-        page = (await self.request(path="/api/tasks/%s?offset=20&limit=20&snapshot=%s" % (task, detail["snapshot"])))[2]
+        page = (await self.request(path="/api/workers/%s?offset=20&limit=20&snapshot=%s" % (task, detail["snapshot"])))[2]
         self.assertNotEqual(detail["timeline"][0], page["timeline"][0])
         self.assertLessEqual(page["total"], 500)
 
@@ -988,12 +1038,12 @@ class WebCase(ServiceCase):
             {"type": "assistant", "message": {"content": "done"}},
         ]
         path.write_text("\n".join(json.dumps(row) for row in rows))
-        first = (await self.request(path="/api/tasks/%s?limit=2" % task))[2]
+        first = (await self.request(path="/api/workers/%s?limit=2" % task))[2]
         self.assertEqual(first["source"], "transcript")
         self.assertEqual(first["total"], 7)
         self.assertEqual([s["kind"] for s in first["timeline"]], ["thinking", "received"])
         self.assertEqual(first["timeline"][1]["text"], "real request")
-        page = (await self.request(path="/api/tasks/%s?offset=2&limit=20&snapshot=%s" % (task, first["snapshot"])))[2]
+        page = (await self.request(path="/api/workers/%s?offset=2&limit=20&snapshot=%s" % (task, first["snapshot"])))[2]
         self.assertEqual([s["kind"] for s in page["timeline"]], ["tool_call", "said", "tool_result", "tool_result", "said"])
         self.assertEqual(page["timeline"][1]["text"], "I saw " + notice)
         self.assertTrue(page["timeline"][2]["error"])
@@ -1010,7 +1060,7 @@ class WebCase(ServiceCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         text = "[Your previous response had no visible output. Please continue.]\nPlease run [pytest -q]"
         path.write_text(json.dumps({"type": "user", "message": {"content": text}}) + "\n")
-        detail = (await self.request(path="/api/tasks/%s" % task))[2]
+        detail = (await self.request(path="/api/workers/%s" % task))[2]
         self.assertEqual([s["text"] for s in detail["timeline"]], [text])
 
     async def test_hidden_transcript_entries_do_not_displace_visible_tail(self):
@@ -1020,7 +1070,7 @@ class WebCase(ServiceCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         texts = ["keep this response"] + [" ", "[Your previous response had no visible output. Please continue.]"] * 300
         path.write_text("\n".join(json.dumps({"type": "assistant", "message": {"content": text}}) for text in texts))
-        detail = (await self.request(path="/api/tasks/%s" % task))[2]
+        detail = (await self.request(path="/api/workers/%s" % task))[2]
         self.assertEqual([s["text"] for s in detail["timeline"]], ["keep this response"])
         self.assertEqual(detail["total"], 1)
         self.assertFalse(detail["truncated"])
@@ -1032,7 +1082,7 @@ class WebCase(ServiceCase):
         self.store.event("worker", "text", task, text="keep this response")
         for _ in range(600):
             self.store.event("worker", "text", task, text=" ")
-        detail = (await self.request(path="/api/tasks/%s" % task))[2]
+        detail = (await self.request(path="/api/workers/%s" % task))[2]
         speech = [json.loads(s["text"])["text"] for s in detail["timeline"] if s["tool"] == "text"]
         self.assertEqual(speech, ["keep this response"])
         self.assertFalse(detail["truncated"])
@@ -1044,7 +1094,7 @@ class WebCase(ServiceCase):
         path = self.session_path(self.store.task(task)["session_id"])
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"type": "assistant", "message": {"content": " "}}) + "\n")
-        detail = (await self.request(path="/api/tasks/%s" % task))[2]
+        detail = (await self.request(path="/api/workers/%s" % task))[2]
         self.assertEqual(detail["source"], "transcript")
         self.assertEqual(detail["timeline"], [])
         self.assertEqual(detail["total"], 0)
@@ -1056,7 +1106,7 @@ class WebCase(ServiceCase):
         for text in ("", "  ", "[Your previous response had no visible output. Please continue.]", "visible"):
             self.store.event("worker", "text", task, text=text)
         self.store.event("worker", "tool", task, tool="Bash", input="")
-        detail = (await self.request(path="/api/tasks/%s" % task))[2]
+        detail = (await self.request(path="/api/workers/%s" % task))[2]
         self.assertEqual(detail["source"], "events")
         speech = [s for s in detail["timeline"] if s["tool"] == "text"]
         self.assertEqual([json.loads(s["text"])["text"] for s in speech], ["visible"])
@@ -1072,19 +1122,19 @@ class WebCase(ServiceCase):
                 for i in range(start, end):
                     file.write(json.dumps({"type": "assistant", "message": {"content": "step-%d" % i}}) + "\n")
         append(0, 600)
-        first = (await self.request(path="/api/tasks/%s?limit=100" % task))[2]
+        first = (await self.request(path="/api/workers/%s?limit=100" % task))[2]
         self.assertEqual(first["timeline"][-1]["text"], "step-199")
         append(600, 620)
-        next_page = (await self.request(path="/api/tasks/%s?offset=100&snapshot=%s" % (task, first["snapshot"])))[2]
+        next_page = (await self.request(path="/api/workers/%s?offset=100&snapshot=%s" % (task, first["snapshot"])))[2]
         self.assertEqual(next_page["timeline"][0]["text"], "step-200")
         self.store.update_task(task, status="completed", report="fresh report", ended=time.time())
-        meta = (await self.request(path="/api/tasks/%s?metadata=1" % task))[2]
+        meta = (await self.request(path="/api/workers/%s?metadata=1" % task))[2]
         self.assertEqual(meta["task"]["status"], "completed")
         self.assertEqual(meta["task"]["report"], "fresh report")
         self.assertNotIn("timeline", meta)
         self.service.web.snapshots[first["snapshot"]]["expires"] = 0
-        self.assertEqual((await self.request(path="/api/tasks/%s?offset=100&snapshot=%s" % (task, first["snapshot"])))[0], 409)
-        self.assertEqual((await self.request(path="/api/tasks/%s?offset=100" % task))[0], 400)
+        self.assertEqual((await self.request(path="/api/workers/%s?offset=100&snapshot=%s" % (task, first["snapshot"])))[0], 409)
+        self.assertEqual((await self.request(path="/api/workers/%s?offset=100" % task))[0], 400)
 
     async def test_cookie_and_history_survive_daemon_restart(self):
         cookie = self.cookie
@@ -1113,7 +1163,7 @@ class WebCase(ServiceCase):
         code, _, state = await self.request()
         self.assertEqual(code, 200)
         self.assertIn("profile removed", state["tasks"][0]["model"])
-        self.assertEqual((await self.request(path="/api/tasks/%s" % task))[0], 200)
+        self.assertEqual((await self.request(path="/api/workers/%s" % task))[0], 200)
 
     async def test_atomic_message_idempotency_and_notification_history(self):
         original = self.store.run
@@ -1153,9 +1203,9 @@ class WebCase(ServiceCase):
             self.assertEqual(probe.call_count, 4)
 
     async def test_port_conflict_does_not_stop_service_and_cli_link(self):
-        from super_super_harness.web import Web
+        from super_super_harness.channels.web import Web
         other = Web(self.service)
-        with self.assertLogs("super_super_harness.web", level="WARNING"):
+        with self.assertLogs("super_super_harness.channels.web", level="WARNING"):
             await other.start()
         self.assertFalse(other.status()["listening"])
         self.assertIn("unavailable", other.status()["error"])
@@ -1170,6 +1220,98 @@ class WebCase(ServiceCase):
         self.assertNotIn("token=", output.getvalue())
         status = await self.service.dispatch(("owner", None), "status", {}, None)
         self.assertTrue(status["web"]["listening"])
+
+    async def test_worker_code_routes_resolve_all_actions_to_internal_ids(self):
+        from unittest.mock import AsyncMock
+        tid = self.store.add_task('Entry work', 'brief', 'work', None, 'session', '', '', code_name='Gate-2', role='Entries')
+        other = self.store.add_task('Other work', 'brief', 'work', None, 'other', '', '', code_name=tid)
+        for worker, selector, expected in [('Gate-2', '', tid), ('gAtE-2', '', tid), (tid, '', other),
+                                           (tid, 'by=id', tid), (other, '', other)]:
+            status, _, response = await self.request(path='/api/workers/' + worker + '?' + selector + '&metadata=1')
+            self.assertEqual(status, 200)
+            self.assertEqual(response['task']['id'], expected)
+            self.assertEqual(response['task']['code_name'], self.store.task(expected)['code_name'])
+            for action, method, body in [('send', 'send', {'text': 'Hello'}), ('interrupt', 'interrupt', {}),
+                                         ('resume', 'resume', {}), ('stop', 'stop', {}), ('model', 'switch_model', {'profile': 'work'})]:
+                mock_type = AsyncMock if action in ('stop', 'model') else None
+                with patch.object(self.service.tasks, method, **({'new_callable': mock_type} if mock_type else {}), return_value={'ok': True}) as call:
+                    self.assertEqual((await self.request('POST', '/api/workers/' + worker + '/' + action + '?' + selector, body))[0], 200)
+                    self.assertEqual(call.call_args.args[0], expected)
+            with patch.object(self.service.web, 'diff', new_callable=AsyncMock, return_value={'text': 'diff'}) as diff:
+                self.assertEqual((await self.request(path='/api/workers/' + worker + '/diff?' + selector))[0], 200)
+                diff.assert_awaited_once_with(expected)
+        self.service.tasks.rename(tid, 'Arch')
+        self.assertEqual((await self.request(path='/api/workers/Gate-2'))[0], 404)
+        self.assertEqual((await self.request(path='/api/workers/arch?metadata=1'))[2]['task']['id'], tid)
+        self.assertEqual((await self.request(path='/api/workers/' + tid + '?by=id&metadata=1'))[2]['task']['id'], tid)
+        self.assertEqual((await self.request(path='/api/workers/Arch?by=typo'))[0], 400)
+        for path in ['/api/tasks/' + tid, '/api/workers/missing', '/api/workers/1invalid', '/api/workers/' + 'A' * 25]:
+            self.assertEqual((await self.request(path=path))[0], 404)
+
+    async def test_worker_summaries_latest_assignment_and_new_router_tools(self):
+        with patch.object(self.service.tasks, 'schedule'):
+            tid = self.start_task('Initial work', code_name='Gate', role='Entry points')
+            self.service.tasks.send(tid, 'Latest ' + '界' * 250)
+        for task in [(await self.request())[2]['tasks'][0],
+                     (await self.request(path='/api/workers/gate?metadata=1'))[2]['task']]:
+            self.assertEqual(task['code_name'], task['worker_name'])
+            self.assertEqual(task['role'], 'Entry points')
+            self.assertEqual(task['assignment'], ('Latest ' + '界' * 250)[:200])
+        self.store.open_turn()
+        for index, tool in enumerate(('worker_hire', 'worker_assign', 'worker_say', 'worker_interrupt')):
+            key = 'entry-call-' + str(index)
+            self.store.event('router', 'tool', tool='mcp__router__' + tool,
+                             input=json.dumps({'worker': 'gAtE', 'text': 'hello'}), call_key=key)
+            self.store.event('router', 'tool.completed', call_key=key, ok=True)
+        self.store.event('router', 'task.started', task_id=tid)
+        self.store.event('router', 'task.message', task_id=tid, text='hello')
+        self.service.router.reply('Assigned')
+        message = (await self.request(path='/api/conversation'))[2]['items'][-1]
+        self.assertEqual(message['tasks'], [tid])
+        calls = {step['name']: step for step in message['steps']}
+        for tool in ('worker_hire', 'worker_assign', 'worker_say'):
+            self.assertTrue(calls['mcp__router__' + tool]['hidden'])
+        self.assertFalse(calls['mcp__router__worker_interrupt']['hidden'])
+        self.assertEqual(message['workers'][0]['code_name'], 'Gate')
+        # A tool-only reference must link the stored Worker, not the public name as a graph key.
+        self.store.run("DELETE FROM events WHERE type IN ('task.started','task.message')")
+        message = (await self.request(path='/api/conversation'))[2]['items'][-1]
+        self.assertEqual(message['tasks'], [tid])
+
+    async def test_tool_targets_survive_renames_and_ignore_conflicting_input_names(self):
+        tid = self.store.add_task('Entry work', 'brief', 'work', None, 'session', '', '', code_name='Gate')
+        other = self.store.add_task('Other work', 'brief', 'work', None, 'other', '', '', code_name=tid)
+        self.store.open_turn()
+        # 1b persists the resolved id in event data, separate from the mutable tool input.
+        event = self.store.event('router', 'tool', tool='mcp__router__worker_interrupt')
+        self.store.run('UPDATE events SET data=? WHERE id=?', json.dumps({
+            'tool': 'mcp__router__worker_interrupt', 'task_id': tid,
+            'input': json.dumps({'worker': 'Gate'})}), event)
+        self.service.router.reply('Interrupted')
+        self.service.tasks.rename(tid, 'Arch')
+        self.store.run("DELETE FROM events WHERE type='task.renamed'")
+        message = (await self.request(path='/api/conversation'))[2]['items'][-1]
+        self.assertEqual(message['tasks'], [tid])
+        self.assertEqual(message['workers'][0]['code_name'], 'Arch')
+        self.assertEqual(message['steps'][0]['task_id'], tid)
+        # Even when a code name resembles an id, the durable field is never resolved as a name.
+        self.store.run('UPDATE events SET data=? WHERE id=?', json.dumps({
+            'tool': 'mcp__router__worker_interrupt', 'task_id': tid,
+            'input': json.dumps({'worker': self.store.task(other)['code_name']})}), event)
+        self.assertEqual((await self.request(path='/api/conversation'))[2]['items'][-1]['tasks'], [tid])
+
+    async def test_usage_returns_current_code_names_without_changing_aggregation_keys(self):
+        from super_super_harness.channels import usage
+        tid = self.store.add_task('Entry work', 'brief', 'work', None, 'session', '', '', code_name='Gate')
+        start, end = usage.window({})
+        before = usage.read_report(self.cfg, {'running': 0, 'limit': 2}, start, end)
+        self.assertEqual(before['tasks'][0]['task_id'], tid)
+        self.assertEqual(before['tasks'][0]['code_name'], 'Gate')
+        self.service.tasks.rename(tid, 'Arch')
+        after = usage.read_report(self.cfg, {'running': 0, 'limit': 2}, start, end)
+        self.assertEqual(after['tasks'][0]['code_name'], 'Arch')
+        self.assertEqual(before['summary'], after['summary'])
+        self.assertTrue(all(row['code_name'] == 'Router' for row in after['tasks'] if row['task_id'] == 'router'))
 
     async def test_diff_fork_point_and_size_limit(self):
         repo = self.home / "source"
@@ -1192,14 +1334,17 @@ class WebCase(ServiceCase):
         (repo / "source-only").write_text("unrelated\n")
         git("add", ".")
         git("commit", "-qm", "advance source")
-        result = (await self.request(path="/api/tasks/%s/diff" % task))[2]
+        self.assertTrue(t['branch'].startswith('w/'))
+        self.service.tasks.rename(task, 'Renamed')
+        self.assertEqual(self.store.task(task)['branch'], t['branch'])
+        result = (await self.request(path="/api/workers/Renamed/diff"))[2]
         self.assertIn("+changed", result["text"])
         self.assertNotIn("source-only", result["text"])
         self.assertEqual(result["base"], t["base_commit"])
         (cwd / "big").write_text("line contents\n" * 50000)
         subprocess.run(["git", "add", "."], cwd=cwd, check=True, capture_output=True)
         subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-qm", "big"], cwd=cwd, check=True, capture_output=True)
-        result = (await self.request(path="/api/tasks/%s/diff" % task))[2]
+        result = (await self.request(path="/api/workers/%s/diff" % task))[2]
         self.assertTrue(result["truncated"])
         self.assertLessEqual(len(result["text"].encode()), DIFF_LIMIT)
 
@@ -1253,27 +1398,27 @@ class WebCase(ServiceCase):
     async def test_live_snapshot_refresh_does_not_evict_paged_tab(self):
         self.service.tasks.closed = True
         task = self.start_task("brief")
-        first = (await self.request(path="/api/tasks/%s" % task))[2]
-        await self.request(path="/api/tasks/%s?snapshot=%s&offset=0" % (task, first["snapshot"]))
-        second = (await self.request(path="/api/tasks/%s" % task))[2]
+        first = (await self.request(path="/api/workers/%s" % task))[2]
+        await self.request(path="/api/workers/%s?snapshot=%s&offset=0" % (task, first["snapshot"]))
+        second = (await self.request(path="/api/workers/%s" % task))[2]
         for _ in range(8):
-            second = (await self.request(path="/api/tasks/%s?refresh=%s" % (task, second["snapshot"])))[2]
+            second = (await self.request(path="/api/workers/%s?refresh=%s" % (task, second["snapshot"])))[2]
         self.assertEqual(len(self.service.web.snapshots), 2)
-        self.assertEqual((await self.request(path="/api/tasks/%s?snapshot=%s&offset=0" % (task, first["snapshot"])))[0], 200)
+        self.assertEqual((await self.request(path="/api/workers/%s?snapshot=%s&offset=0" % (task, first["snapshot"])))[0], 200)
 
     async def test_closing_paged_timelines_releases_snapshot_slots(self):
         self.service.tasks.closed = True
         for i in range(6):
             task = self.start_task("brief", name="task %d" % i)
-            page = (await self.request(path="/api/tasks/%s" % task))[2]
-            await self.request(path="/api/tasks/%s?snapshot=%s&offset=0" % (task, page["snapshot"]))
+            page = (await self.request(path="/api/workers/%s" % task))[2]
+            await self.request(path="/api/workers/%s?snapshot=%s&offset=0" % (task, page["snapshot"]))
             self.assertTrue(self.service.web.snapshots[page["snapshot"]]["pinned"])
             result = await self.request("POST", "/api/timeline/release", {"snapshot": page["snapshot"]})
             self.assertEqual(result[0], 200)
             self.assertEqual(len(self.service.web.snapshots), 0)
 
     async def test_parallel_instance_cookies_are_port_scoped(self):
-        from super_super_harness.web import Web
+        from super_super_harness.channels.web import Web
         from types import SimpleNamespace
         from dataclasses import replace
         other_home = self.home / "other-instance"
@@ -1320,7 +1465,7 @@ class FrontendRegressions(unittest.TestCase):
     def run_render_test(self, name):
         root = Path(__file__).resolve().parent.parent
         result = subprocess.run(["node", str(root / "tests/web_regressions.js"),
-                                 str(root / "super_super_harness/web/index.html"), name], capture_output=True, text=True, timeout=5)
+                                 str(PAGE), name], capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_chat_fallback_busy_pending_idle_and_unchanged_render(self):
@@ -1429,7 +1574,7 @@ class FrontendRegressions(unittest.TestCase):
         self.run_render_test("usage")
 
     def run_communication_test(self, body):
-        page = Path(__file__).resolve().parent.parent / 'super_super_harness/web/index.html'
+        page = PAGE
         script = r"""
 const assert = require('node:assert/strict'), fs = require('node:fs'), vm = require('node:vm');
 const html = fs.readFileSync(process.argv[1], 'utf8');
@@ -1679,7 +1824,7 @@ assert.deepEqual(opened,['t1']); assert.equal(prevented,2);
 
 class UsageMetadata(unittest.TestCase):
     def test_quota_hook_is_optional_validated_and_allowlisted(self):
-        from super_super_harness.usage import quota_snapshot
+        from super_super_harness.channels.usage import quota_snapshot
         self.assertEqual(quota_snapshot('fixture'), {'provider': 'fixture', 'status': 'unconfigured'})
         reader = lambda: {'limit': 1000, 'remaining': 400, 'key': 'PRIVATE-KEY', 'text': 'PRIVATE-BODY'}
         self.assertEqual(quota_snapshot('fixture', {'fixture': reader}),
@@ -1694,7 +1839,7 @@ class UsageMetadata(unittest.TestCase):
         self.assertNotIn('PRIVATE-KEY', json.dumps(quota_snapshot('fixture', {'fixture': broken})))
 
     def test_usage_session_rejects_symlink_and_conflicting_model_identity(self):
-        from super_super_harness.usage import FILE_BYTES, session_rows
+        from super_super_harness.channels.usage import FILE_BYTES, session_rows
         with tempfile.TemporaryDirectory() as folder:
             target = Path(folder) / 'fixture.jsonl'
             link = Path(folder) / 'link.jsonl'
@@ -1712,7 +1857,7 @@ class UsageMetadata(unittest.TestCase):
             self.assertTrue(all(counts is None for _, _, counts in rows))
 
     def test_usage_descriptor_open_blocks_replacement_symlink_and_fifo(self):
-        from super_super_harness import usage
+        from super_super_harness.channels import usage
         with tempfile.TemporaryDirectory() as folder:
             target = Path(folder) / 'fixture.jsonl'
             other = Path(folder) / 'other.jsonl'
@@ -1740,14 +1885,14 @@ class UsageMetadata(unittest.TestCase):
             os.mkfifo(target)
             # Child deadline keeps a regression from hanging the whole test suite.
             import sys
-            script = ('from pathlib import Path; from super_super_harness.usage import session_rows,FILE_BYTES; '
+            script = ('from pathlib import Path; from super_super_harness.channels.usage import session_rows,FILE_BYTES; '
                       'import sys; rows,incomplete,*_=session_rows(Path(sys.argv[1]),FILE_BYTES); '
                       'assert rows==[] and incomplete')
             result = subprocess.run([sys.executable, '-c', script, str(target)], capture_output=True, text=True, timeout=3)
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_usage_report_does_not_migrate_or_write_existing_database(self):
-        from super_super_harness import usage
+        from super_super_harness.channels import usage
         from tests.support import write_config
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder)
@@ -1774,7 +1919,7 @@ class UsageMetadata(unittest.TestCase):
 
 class Migration(unittest.TestCase):
     def test_messages_turn_index_is_used_for_new_and_existing_databases(self):
-        from super_super_harness.store import SCHEMA
+        from super_super_harness.core.store import SCHEMA
         for legacy in (False, True):
             with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "router.db"
@@ -1799,12 +1944,12 @@ class Migration(unittest.TestCase):
                 store.close()
 
     def test_existing_database_columns_and_history_are_preserved(self):
-        from super_super_harness.store import SCHEMA
+        from super_super_harness.core.store import SCHEMA
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "router.db"
             db = sqlite3.connect(path)
             db.executescript(SCHEMA)
-            db.execute("INSERT INTO tasks(id,name,profile,status,session_id,brief,created,updated) VALUES('t1','legacy','work','waiting','s','b',1,2)")
+            db.execute("INSERT INTO tasks(id,code_name,name,profile,status,session_id,brief,created,updated,last_active) VALUES('t1','Nova','legacy','work','waiting','s','b',1,2,2)")
             db.execute("INSERT INTO messages(uuid,role,text,channel,created) VALUES('u','user','hello','terminal',1)")
             db.execute("INSERT INTO outbox(channel,kind,text,created) VALUES('terminal','answer','hi',2)")
             db.commit()

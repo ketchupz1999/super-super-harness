@@ -11,10 +11,10 @@ import unittest
 from unittest.mock import patch
 import zlib
 
-from super_super_harness import config
-from super_super_harness.avatar import Avatar, FLASH_SECONDS, LIMIT
+from super_super_harness.ops import config
+from super_super_harness.channels.avatar import Avatar, FLASH_SECONDS, LIMIT
 from super_super_harness.daemon import Service
-from super_super_harness.store import Store
+from super_super_harness.core.store import Store
 from tests import test_web
 from tests.support import ServiceCase, free_port, write_config
 
@@ -50,7 +50,7 @@ class AvatarTests(unittest.TestCase):
         return self.avatar.state()['state']
 
     def event(self, kind):
-        with patch('super_super_harness.store.time.time',return_value=self.now):
+        with patch('super_super_harness.core.store.time.time',return_value=self.now):
             return self.store.event('system',kind)
 
     def test_seven_state_precedence_and_timed_return_to_running_worker(self):
@@ -101,14 +101,14 @@ class AvatarTests(unittest.TestCase):
         self.avatar = Avatar(self.service,clock=lambda:self.now)
         self.assertEqual(self.state(),'waiting')
         self.store.unset('router_waiting')
-        with patch('super_super_harness.store.time.time',return_value=self.now):
+        with patch('super_super_harness.core.store.time.time',return_value=self.now):
             self.store.add_message('new','user','new activity')
         self.assertEqual(self.state(),'idle')
         self.now += 1
         self.event('avatar.done')
         self.now += 4
         self.assertEqual(self.state(),'rest')
-        with patch('super_super_harness.store.time.time',return_value=self.now):
+        with patch('super_super_harness.core.store.time.time',return_value=self.now):
             self.store.event('router','task.started')
         self.assertEqual(self.state(),'idle')
 

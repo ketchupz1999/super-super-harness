@@ -6,9 +6,11 @@ import unittest
 
 import time
 
-from super_super_harness import procs, releases, workspace
+from super_super_harness.adapters import procs
+from super_super_harness.ops import releases
+from super_super_harness.workers import workspace
 from super_super_harness.adapters import claude_code as harness
-from super_super_harness.store import Store
+from super_super_harness.core.store import Store
 from tests.support import ServiceCase
 
 
@@ -19,6 +21,102 @@ class Lifecycle(ServiceCase):
         self.assertEqual(self.store.task(task_id)["report"], "all good")
         await self.until(lambda: self.store.one("SELECT 1 FROM messages WHERE kind='worker.done'"), label="done event")
         await self.until(lambda: task_id not in self.service.tasks.live, label="process gone")
+
+    async def test_inline_background_notification_completes_with_only_one_result(self):
+        self.cfg.limits["background_grace_seconds"] = 0.1
+        task_id = self.start_task("BACKGROUND_INLINE DONE inline-report ECHO foreground")
+        await self.wait_status(task_id, "completed", timeout=4)
+        await self.until(lambda: task_id not in self.service.tasks.live, label="inline process closed")
+        self.assertEqual(self.store.task(task_id)["report"], "inline-report")
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM events WHERE task_id=? AND type='result'", task_id)["n"], 1)
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM messages WHERE task_id=? AND kind='worker.done'", task_id)["n"], 1)
+        transcript = self.session_path(self.store.task(task_id)["session_id"]).read_text()
+        self.assertIn('"type": "queued_command"', transcript)
+        self.service.tasks.say(task_id, "ECHO after-completion")
+        await self.wait_status(task_id, "completed", timeout=4)
+        self.assertEqual(self.store.task(task_id)["report"], "after-completion")
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM events WHERE task_id=? AND type='result'", task_id)["n"], 2)
+
+    async def test_host_followup_after_inline_notification_can_complete(self):
+        self.cfg.limits["background_grace_seconds"] = 0.1
+        task_id = self.start_task("BACKGROUND_INLINE SLEEP 0.3 ECHO foreground")
+        await self.until(lambda: task_id in self.service.tasks.live and self.service.tasks.live[task_id].background_pending,
+                         label="inline notification debt")
+        self.service.tasks.say(task_id, "ECHO host-followup")
+        await self.wait_status(task_id, "completed", timeout=4)
+        self.assertEqual(self.store.task(task_id)["report"], "host-followup")
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM events WHERE task_id=? AND type='result'", task_id)["n"], 2)
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM messages WHERE task_id=? AND kind='worker.done'", task_id)["n"], 1)
+
+    async def test_completion_stuck_wakes_router_with_warning(self):
+        self.cfg.limits["background_grace_seconds"] = 4000
+        task_id = self.start_task("BACKGROUND_INLINE ECHO foreground")
+        await self.until(lambda: self.store.one("SELECT 1 FROM events WHERE task_id=? AND type='result'", task_id))
+        run = self.service.tasks.live[task_id]
+        run.idle_since = run.background_empty_since = time.time() - 1801
+        await self.service.tasks.tick()
+        event = self.store.one("SELECT severity FROM events WHERE task_id=? AND source='system' AND type='worker.completion_stuck'", task_id)
+        self.assertEqual(event["severity"], "error")
+        self.assertIsNotNone(self.store.one("SELECT 1 FROM messages WHERE task_id=? AND kind='worker.completion_stuck'", task_id))
+        trigger = self.store.one("SELECT severity,route FROM triggers WHERE thread=? AND type='worker.completion_stuck'", "task:" + task_id)
+        self.assertEqual((trigger["severity"], trigger["route"]), ("warn", "wake"))
+        self.assertEqual(self.status(task_id), "running")
+
+    async def test_background_finishes_before_foreground(self):
+        task_id = self.start_task("BACKGROUND 0.1 SLEEP 0.6 ECHO foreground")
+        await self.wait_status(task_id, "completed")
+        await self.until(lambda: task_id not in self.service.tasks.live, label="process closed")
+        count = self.store.one("SELECT COUNT(*) n FROM events WHERE task_id=? AND type='result'", task_id)["n"]
+        self.assertEqual(count, 2, "completion dropped the internally queued background notification result")
+        self.assertEqual(self.store.task(task_id)["report"], "background finished")
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM messages WHERE task_id=? AND kind='worker.done'", task_id)["n"], 1)
+
+    async def test_multiple_background_notifications_are_all_consumed(self):
+        for command, results in (("BACKGROUND 0.1 BACKGROUND 0.1", 3), ("BACKGROUND_BATCH 0.1 3", 2)):
+            with self.subTest(command=command):
+                task_id = self.start_task(command + " SLEEP 0.6 ECHO foreground")
+                await self.wait_status(task_id, "completed")
+                await self.until(lambda: task_id not in self.service.tasks.live, label="notifications drained")
+                self.assertEqual(self.store.one("SELECT COUNT(*) n FROM events WHERE task_id=? AND type='result'", task_id)["n"], results)
+                self.assertEqual(self.store.task(task_id)["report"], "background finished")
+                self.assertEqual(self.store.one("SELECT COUNT(*) n FROM messages WHERE task_id=? AND kind='worker.done'", task_id)["n"], 1)
+
+    async def test_followup_queued_before_background_notification_is_not_completion(self):
+        task_id = self.start_task("BACKGROUND 0.4 SLEEP 0.8 ECHO foreground")
+        await self.until(lambda: task_id in self.service.tasks.live and self.service.tasks.live[task_id].background,
+                         label="background started")
+        self.service.tasks.send(task_id, "ECHO ordinary-followup")
+        await self.wait_status(task_id, "completed")
+        await self.until(lambda: task_id not in self.service.tasks.live, label="notification processed")
+        self.assertEqual(self.store.task(task_id)["report"], "background finished")
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM events WHERE task_id=? AND type='result'", task_id)["n"], 3)
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM messages WHERE task_id=? AND kind='worker.done'", task_id)["n"], 1)
+
+    async def test_process_exit_with_background_work_does_not_leave_running(self):
+        self.cfg.limits["worker_retries"] = 0
+        for command in ("BACKGROUND 60 ECHO foreground", "BACKGROUND 0.1 SLEEP 0.6 CRASH"):
+            with self.subTest(command=command):
+                task_id = self.start_task(command)
+                if "CRASH" not in command:
+                    await self.until(lambda: self.store.one("SELECT 1 FROM events WHERE task_id=? AND type='result'", task_id))
+                    self.assertEqual(self.status(task_id), "running")
+                    self.service.tasks.live[task_id].process.proc.kill()
+                await self.wait_status(task_id, "failed")
+                await self.until(lambda: task_id not in self.service.tasks.live, label="exited process removed")
+                self.assertIsNone(self.store.one("SELECT 1 FROM messages WHERE task_id=? AND kind='worker.done'", task_id))
+                self.assertEqual(self.store.one("SELECT status FROM assignments WHERE task_id=?", task_id)["status"], "failed")
+
+    async def test_background_wait_uses_stall_reminder_without_finishing(self):
+        task_id = self.start_task("BACKGROUND 60 ECHO foreground")
+        await self.until(lambda: self.store.one("SELECT 1 FROM events WHERE task_id=? AND type='result'", task_id))
+        run = self.service.tasks.live[task_id]
+        run.last_event = time.time() - self.cfg.limits["stall_minutes"] * 60 - 1
+        await self.service.tasks.tick()
+        self.assertTrue(run.stalled)
+        self.assertEqual(self.status(task_id), "running")
+        self.assertFalse(run.ending)
+        self.assertIsNotNone(self.store.one("SELECT 1 FROM events WHERE task_id=? AND type='worker.stalled'", task_id))
+        self.assertIsNone(self.store.one("SELECT 1 FROM messages WHERE task_id=? AND kind='worker.done'", task_id))
 
     async def test_limit_queues_the_rest_in_order(self):
         first, second, third = [self.start_task("SLEEP 1 ECHO x") for _ in range(3)]
@@ -49,6 +147,136 @@ class Lifecycle(ServiceCase):
         self.assertIn("--session-id", runs[0]["argv"])
         self.assertIn("--resume", runs[1]["argv"])
         self.assertEqual(self.store.task(task_id)["question"], "")
+
+    async def test_answer_reaches_a_waiting_worker_with_background_tasks(self):
+        for method in ("send", "say"):
+            with self.subTest(method=method):
+                tasks = self.service.tasks
+                task_id = self.start_task("BACKGROUND 2 SLEEP 0.3 ECHO asked")
+                await self.worker_ready(task_id)
+                run = tasks.live[task_id]
+                await self.until(lambda: run.background and not run.pending_uuids, label="background started")
+                tasks.ask_user(task_id, "要继续吗", ["继续", "停止"])
+                await self.until(lambda: self.store.one("SELECT 1 FROM events WHERE task_id=? AND type='result'", task_id), label="question turn ended")
+                self.assertEqual(self.status(task_id), "waiting")
+                self.assertIs(tasks.live[task_id], run)
+                tasks.tell(task_id, "ECHO held-note")
+                tasks.deliver(task_id, "ECHO held-event")
+                self.assertEqual(self.status(task_id), "waiting")
+                answer = getattr(tasks, method)(task_id, "SLEEP 0.2 DONE reply-report ECHO answer")
+                self.assertEqual(answer.get("delivered"), "after the current command")
+                self.assertEqual((self.status(task_id), self.store.task(task_id)["question"], json.loads(self.store.task(task_id)["pending"])),
+                                 ("running", "", []))
+                await self.until(lambda: not run.pending_uuids, label="reply acknowledged")
+                lines = self.session_path(self.store.task(task_id)["session_id"]).read_text().splitlines()
+                inputs = [row["message"]["content"] for row in map(json.loads, lines) if row["type"] == "user"]
+                self.assertEqual(inputs[-3:], ["ECHO held-note", "ECHO held-event", "SLEEP 0.2 DONE reply-report ECHO answer"])
+                if method == "send":
+                    self.assertEqual(self.store.one("SELECT status FROM assignments WHERE task_id=? ORDER BY id DESC LIMIT 1", task_id)["status"], "doing")
+                else:
+                    self.assertEqual(tasks._pending_says(task_id), [])
+                    self.assertEqual(self.store.one("SELECT COUNT(*) n FROM assignments WHERE task_id=?", task_id)["n"], 1)
+                questions = self.store.all("SELECT text FROM messages WHERE task_id=? AND kind='worker.question'", task_id)
+                self.assertEqual(len(questions), 1)
+                self.assertIn("继续 / 停止", questions[0]["text"])
+                await self.until(lambda: self.store.task(task_id)["report"] == "reply-report", label="reply report")
+                self.assertEqual(self.status(task_id), "running")
+                self.assertTrue(run.background)
+                self.assertIsNone(self.store.one("SELECT 1 FROM messages WHERE task_id=? AND kind='worker.done'", task_id))
+                await self.until(lambda: task_id not in tasks.live, label="background and process ended")
+                task = self.store.task(task_id)
+                self.assertEqual((task["status"], task["report"], json.loads(task["pending"])), ("completed", "reply-report", []))
+                self.assertIsNone(self.store.one("SELECT 1 FROM assignments WHERE task_id=? AND status='queued'", task_id))
+                self.assertEqual(self.store.one("SELECT COUNT(*) n FROM worker_runs WHERE task_id=?", task_id)["n"], 1)
+                done = self.store.all("SELECT text FROM messages WHERE task_id=? AND kind='worker.done'", task_id)
+                self.assertEqual(len(done), 1)
+                self.assertIn("reply-report", done[0]["text"])
+
+    async def test_undelivered_input_restarts_instead_of_completing(self):
+        for source in ("pending", "assignment", "say"):
+            with self.subTest(source=source):
+                tasks = self.service.tasks
+                task_id = self.start_task("SLEEP 0.4 ECHO obsolete")
+                await self.worker_ready(task_id)
+                run = tasks.live[task_id]
+                await self.until(lambda: not run.pending_uuids, label="brief acknowledged")
+                text = "ECHO recovered-%s" % source
+                # Simulate persisted input which did not reach the live process (the B19 end state).
+                if source == "pending":
+                    tasks._hold_input(task_id, text)
+                elif source == "assignment":
+                    tasks._assign(task_id, text)
+                else:
+                    self.store.set("say_pending:" + task_id, json.dumps([{"id": "unread", "text": text, "created": time.time()}]))
+                tasks.held.add(task_id)   # inspect the guard before allowing the scheduler to restart
+                try:
+                    with self.assertLogs("super_super_harness.workers.tasks", level="ERROR") as logs:
+                        await self.until(lambda: task_id not in tasks.live, label="guard ended process")
+                    self.assertIn("cannot complete", logs.output[0])
+                    self.assertEqual(self.status(task_id), "queued")
+                    self.assertEqual(self.store.one("SELECT status FROM assignments WHERE task_id=? ORDER BY id LIMIT 1", task_id)["status"], "doing")
+                    self.assertIsNone(self.store.one("SELECT 1 FROM messages WHERE task_id=? AND kind='worker.done'", task_id))
+                    self.assertEqual(self.store.one("SELECT severity FROM events WHERE task_id=? AND type='worker.completion_deferred'", task_id)["severity"], "error")
+                finally:
+                    tasks.release(task_id)
+                await self.wait_status(task_id, "completed")
+                await self.until(lambda: task_id not in tasks.live, label="recovered process ended")
+                task = self.store.task(task_id)
+                self.assertEqual((task["report"], json.loads(task["pending"]), tasks._pending_says(task_id)), ("recovered-%s" % source, [], []))
+                self.assertIsNone(self.store.one("SELECT 1 FROM assignments WHERE task_id=? AND status='queued'", task_id))
+                self.assertEqual(self.store.one("SELECT COUNT(*) n FROM worker_runs WHERE task_id=?", task_id)["n"], 2)
+                self.assertEqual(self.store.one("SELECT COUNT(*) n FROM messages WHERE task_id=? AND kind='worker.done'", task_id)["n"], 1)
+
+    async def test_pending_restart_waits_for_old_workspace_cleanup(self):
+        import threading
+        from unittest.mock import patch
+        tasks = self.service.tasks
+        self.cfg.limits["worker_retries"] = 0
+        task_id = self.start_task("SLEEP 0.4 ECHO obsolete")
+        await self.worker_ready(task_id)
+        run = tasks.live[task_id]
+        await self.until(lambda: not run.pending_uuids, label="brief acknowledged")
+        tasks._hold_input(task_id, "SLEEP 0.3 ECHO recovered")
+        entered, release = threading.Event(), threading.Event()
+        sweep = procs.sweep
+        def delayed_sweep(root):
+            if not entered.is_set():
+                entered.set()
+                release.wait(10)
+            return sweep(root)
+        with patch.object(procs, "sweep", side_effect=delayed_sweep):
+            try:
+                with self.assertLogs("super_super_harness.workers.tasks", level="ERROR"):
+                    await self.until(entered.is_set, label="old workspace sweep")
+                self.assertEqual(self.status(task_id), "queued")
+                self.assertNotIn(task_id, tasks.live)
+                tasks.schedule()
+                self.assertNotIn(task_id, tasks.live)
+                self.assertEqual(self.store.one("SELECT COUNT(*) n FROM worker_runs WHERE task_id=?", task_id)["n"], 1)
+            finally:
+                release.set()
+            await self.wait_status(task_id, "completed")
+            await self.until(lambda: task_id not in tasks.live and task_id not in tasks.retrying, label="recovered process ended")
+        self.assertEqual(self.store.task(task_id)["report"], "recovered")
+        runs = self.store.all("SELECT exit_code FROM worker_runs WHERE task_id=?", task_id)
+        self.assertEqual(len(runs), 2)
+        self.assertTrue(all(row["exit_code"] == 0 for row in runs), runs)
+        self.assertIsNone(self.store.one("SELECT 1 FROM messages WHERE task_id=? AND kind='worker.failed'", task_id))
+
+    async def test_background_turns_notify_each_question_only_once(self):
+        task_id = self.start_task("BACKGROUND 0.8 BACKGROUND 1.5 SLEEP 0.3 ECHO asked")
+        tasks = self.service.tasks
+        await self.worker_ready(task_id)
+        run = tasks.live[task_id]
+        await self.until(lambda: run.background and not run.pending_uuids, label="background started")
+        tasks.ask_user(task_id, "同一个问题？")
+        await self.until(lambda: self.store.one("SELECT 1 FROM messages WHERE task_id=? AND kind='worker.question'", task_id), label="question notified before background ends")
+        self.assertTrue(run.background)
+        await self.until(lambda: task_id not in tasks.live, label="background and process ended")
+        self.assertEqual(self.status(task_id), "waiting")
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM messages WHERE task_id=? AND kind='worker.question'", task_id)["n"], 1)
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM events WHERE task_id=? AND type='result'", task_id)["n"], 3)
+        self.assertIsNone(self.store.one("SELECT 1 FROM messages WHERE task_id=? AND kind='worker.done'", task_id))
 
     async def test_send_refuses_a_stale_view(self):
         task_id = self.start_task("ECHO done")
@@ -109,8 +337,8 @@ class Lifecycle(ServiceCase):
         task_id = self.start_task("ECHO ok", repo=str(repo))
         await self.wait_status(task_id, "completed")
         task = self.store.task(task_id)
-        self.assertEqual(task["branch"], "task/" + task_id)
-        self.assertIn("task/" + task_id, subprocess.run(["git", "branch"], cwd=repo, capture_output=True, text=True).stdout)
+        self.assertEqual(task["branch"], "w/nova")
+        self.assertIn("w/nova", subprocess.run(["git", "branch"], cwd=repo, capture_output=True, text=True).stdout)
         self.assertTrue(os.path.isfile(task["cwd"] + "/.git"))
 
     async def test_restart_kills_the_old_worker_and_resumes(self):
@@ -149,7 +377,8 @@ class Lifecycle(ServiceCase):
         task_id = self.start_task("ECHO ok", name="修对账")
         await self.wait_status(task_id, "completed")
         listing = self.service.tasks.render()
-        self.assertIn("近期结束", listing)
+        self.assertIn("杂事", listing)
+        self.assertIn("空闲", listing)
         self.assertIn("修对账", listing)
 
 
@@ -171,7 +400,7 @@ class FinalReport(ServiceCase):
         done = self.store.one("SELECT text FROM messages WHERE kind='worker.done' AND task_id=?", task_id)
         self.assertIn("本人修完后的结论", done["text"])
         self.assertNotIn("子代理的审查结论", done["text"])
-        from super_super_harness.config import REPO_ROOT
+        from super_super_harness.ops.config import REPO_ROOT
         self.assertIn("Only you hand in the final report", (REPO_ROOT / "prompts" / "worker.md").read_text())
 
     async def test_the_worker_itself_hands_in_the_final_report(self):
@@ -469,7 +698,7 @@ class RecoveryOrdering(ServiceCase):
             reader, writer = await asyncio.open_connection("127.0.0.1", self.cfg.web["port"])
             body = json.dumps({"text": "ECHO retry-after-recovery"}).encode()
             cookie = self.service.web.cookie_name + "=" + self.service.web.session_cookie()
-            writer.write(("POST /api/tasks/%s/send HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nOrigin: http://127.0.0.1:%d\r\nCookie: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n"
+            writer.write(("POST /api/workers/%s/send HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nOrigin: http://127.0.0.1:%d\r\nCookie: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n"
                           % (task_id, self.cfg.web["port"], self.cfg.web["port"], cookie, len(body))).encode() + body)
             await writer.drain()
             response = await reader.read()
@@ -482,10 +711,485 @@ class RecoveryOrdering(ServiceCase):
             self.assertEqual(self.store.one("SELECT COUNT(*) n FROM worker_runs WHERE task_id=?", task_id)["n"], 2)
 
 
+class LiveInput(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+        from super_super_harness.workers.tasks import Run, Tasks
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.tasks = Tasks(SimpleNamespace(limits={"max_workers": 1}), self.store, AsyncMock(), None)
+        self.task_id = self.store.add_task("task", "brief", "work", None, "session", "", "")
+        self.process = SimpleNamespace(send=Mock(side_effect=lambda text: "input-%s" % text), close=AsyncMock())
+        self.run = Run(process=self.process, ready=True, pending_uuids=set(), assignments={}, callers={})
+        self.tasks.live[self.task_id] = self.run
+
+    async def test_queue_input_sends_to_ready_process_regardless_of_status(self):
+        for status in ("running", "waiting", "queued"):
+            with self.subTest(status=status):
+                self.store.update_task(self.task_id, status=status, question="q?")
+                self.assertEqual(self.tasks._queue_input(self.task_id, status), "after the current command")
+                self.process.send.assert_called_with(status)
+                task = self.store.task(self.task_id)
+                self.assertEqual((task["status"], task["question"], json.loads(task["pending"])), ("running", "", []))
+                self.assertIn("input-%s" % status, self.run.pending_uuids)
+
+    async def test_launching_input_is_held_and_ending_input_is_queued(self):
+        self.store.update_task(self.task_id, status="running")
+        self.run.ready = False
+        self.assertEqual(self.tasks._queue_input(self.task_id, "launching"), "when the Worker has started")
+        self.assertEqual(self.store.task(self.task_id)["status"], "running")
+        self.run.ready, self.run.ending = True, True
+        self.assertIsNone(self.tasks._queue_input(self.task_id, "ending", first=True))
+        self.process.send.assert_not_called()
+        task = self.store.task(self.task_id)
+        self.assertEqual((task["status"], json.loads(task["pending"])), ("queued", ["ending", "launching"]))
+
+    async def test_failed_send_is_queued_instead_of_reported_delivered(self):
+        from unittest.mock import Mock
+        self.store.update_task(self.task_id, status="waiting", question="q?")
+        self.process.send = Mock(return_value=None)
+        answer = self.tasks.send(self.task_id, "answer")
+        self.assertNotIn("delivered", answer)
+        self.assertEqual(answer["status"], "queued")
+        self.assertEqual(json.loads(self.store.task(self.task_id)["pending"]), ["answer"])
+        self.assertEqual(self.store.one("SELECT status FROM assignments WHERE task_id=?", self.task_id)["status"], "queued")
+
+    async def test_failed_flush_preserves_only_unsent_context_and_answer(self):
+        from unittest.mock import Mock, call
+        self.tasks.ask_user(self.task_id, "q?")
+        self.tasks.tell(self.task_id, "first-context")
+        self.tasks.deliver(self.task_id, "second-context")
+        self.process.send = Mock(side_effect=["first-uuid", None])
+        answer = self.tasks.send(self.task_id, "answer")
+        self.assertNotIn("delivered", answer)
+        self.assertEqual(self.process.send.call_args_list, [call("first-context"), call("second-context")])
+        self.assertEqual(json.loads(self.store.task(self.task_id)["pending"]), ["second-context", "answer"])
+        self.assertEqual(self.run.pending_uuids, {"first-uuid"})
+
+    async def test_events_and_notes_use_live_queued_process_but_do_not_answer_questions(self):
+        for method in ("deliver", "tell"):
+            with self.subTest(method=method):
+                self.store.update_task(self.task_id, status="queued", pending="[]")
+                getattr(self.tasks, method)(self.task_id, method)
+                self.process.send.assert_called_with(method)
+                self.assertEqual(self.store.task(self.task_id)["status"], "running")
+                self.process.send.reset_mock()
+                self.tasks.ask_user(self.task_id, "q?")
+                getattr(self.tasks, method)(self.task_id, "held")
+                self.process.send.assert_not_called()
+                task = self.store.task(self.task_id)
+                self.assertEqual((task["status"], task["question"], json.loads(task["pending"])), ("waiting", "q?", ["held"]))
+
+    async def test_queued_status_alone_blocks_completion(self):
+        self.store.update_task(self.task_id, status="queued")
+        with self.assertLogs("super_super_harness.workers.tasks", level="ERROR"):
+            await self.tasks._on_result(self.task_id, self.run, {"result": "not done"})
+        await asyncio.sleep(0)   # scheduled process close
+        self.assertEqual(self.store.task(self.task_id)["status"], "queued")
+        self.assertTrue(self.run.ending)
+        self.process.close.assert_awaited_once()
+        self.tasks.on_change.assert_not_awaited()
+
+    async def test_distinct_questions_with_identical_text_are_each_notified_once(self):
+        self.run.background = True
+        for _ in range(2):
+            self.tasks.ask_user(self.task_id, "same question", ["yes", "no"])
+            for _ in range(2):
+                await self.tasks._on_result(self.task_id, self.run, {"result": "waiting"})
+        self.assertEqual(self.tasks.on_change.await_count, 2)
+        self.tasks.on_change.assert_awaited_with("worker.question", self.task_id, "same question\n选项：yes / no")
+        self.process.close.assert_not_awaited()
+
+
+class BackgroundCompletion(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+        from super_super_harness.workers.tasks import Run, Tasks
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.tasks = Tasks(SimpleNamespace(limits={"max_workers": 1, "dormant_days": 7, "stall_minutes": 30,
+                                                  "background_grace_seconds": 20}), self.store, AsyncMock(), None)
+        self.task_id = self.store.add_task("task", "brief", "work", None, "session", "", "")
+        self.store.update_task(self.task_id, status="running")
+        self.process = SimpleNamespace(close=AsyncMock())
+        self.run = Run(process=self.process, ready=True, pending_uuids=set(), assignments={}, callers={})
+        self.tasks.live[self.task_id] = self.run
+        self.tasks.schedule = Mock()
+
+    async def event(self, **msg):
+        await self.tasks._on_event(self.task_id, self.run, msg)
+
+    async def snapshot(self, *ids):
+        await self.event(type="system", subtype="background_tasks_changed", tasks=[{"id": value} for value in ids])
+
+    def notification(self, *ids):
+        return "\n".join("<task-notification>\n<task-id>%s</task-id>\n<status>completed</status>\n</task-notification>" % value for value in ids)
+
+    async def notify(self, *ids, blocks=False, **fields):
+        text = self.notification(*ids)
+        content = [{"type": "text", "text": text}] if blocks else text
+        await self.event(type="user", message={"role": "user", "content": content}, **fields)
+
+    async def result(self):
+        await self.event(type="result", subtype="success", result="finished")
+        await asyncio.sleep(0)   # run any scheduled process close
+
+    def assert_running(self):
+        self.assertEqual(self.store.task(self.task_id)["status"], "running")
+        self.assertFalse(self.run.ending)
+        self.tasks.on_change.assert_not_awaited()
+        self.process.close.assert_not_awaited()
+
+    def assert_completed(self):
+        self.assertEqual(self.store.task(self.task_id)["status"], "completed")
+        self.tasks.on_change.assert_awaited_once_with("worker.done", self.task_id, "finished")
+        self.process.close.assert_awaited_once()
+
+    async def tick_after(self, seconds):
+        from unittest.mock import patch
+        with patch("super_super_harness.workers.tasks.time.time", return_value=self.run.idle_since + seconds):
+            await self.tasks.tick()
+        await asyncio.sleep(0)
+
+    async def test_visible_inline_attachment_pays_same_turn_notification(self):
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.event(type="attachment", attachment={"type": "queued_command", "commandMode": "task-notification",
+                                                       "prompt": self.notification("a")})
+        await self.result()
+        self.assert_completed()
+
+    async def test_child_and_ordinary_attachments_do_not_pay_notification_debt(self):
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.event(type="attachment", parent_tool_use_id="child", attachment={"type": "queued_command",
+                         "commandMode": "task-notification", "prompt": self.notification("a")})
+        await self.event(type="attachment", attachment={"type": "queued_command", "commandMode": "prompt",
+                                                       "prompt": self.notification("a")})
+        self.assertFalse(self.run.background_notified)
+        await self.result()
+        self.assert_running()
+
+    async def test_inline_notification_debt_expires_without_another_result(self):
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.result()
+        await self.tick_after(19)
+        self.assert_running()
+        await self.tick_after(21)
+        self.assert_completed()
+        self.assertFalse(self.run.background_pending)
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM events WHERE type='result'")["n"], 1)
+        await self.tick_after(22)
+        self.assert_completed()   # no duplicate done or close
+
+    async def test_empty_snapshot_after_result_starts_its_own_grace(self):
+        from unittest.mock import patch
+        await self.snapshot("a")
+        await self.result()
+        with patch("super_super_harness.workers.tasks.time.time", return_value=self.run.idle_since + 25):
+            await self.snapshot()
+        await self.tick_after(30)
+        self.assert_running()
+        await self.tick_after(46)
+        self.assert_completed()
+
+    async def test_repeated_empty_snapshots_do_not_extend_grace(self):
+        from unittest.mock import patch
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.result()
+        with patch("super_super_harness.workers.tasks.time.time", return_value=self.run.idle_since + 19):
+            await self.snapshot()
+        await self.tick_after(21)
+        self.assert_completed()
+
+    async def test_new_root_activity_cancels_idle_completion(self):
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.result()
+        await self.notify("a")
+        await self.tick_after(21)
+        self.assert_running()
+        await self.result()
+        self.assert_completed()
+
+    async def test_host_reply_resets_grace_then_can_finish(self):
+        from unittest.mock import patch
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.result()
+        old_idle = self.run.idle_since
+        self.run.pending_uuids.add("host")
+        await self.event(type="user", isReplay=True, uuid="host", message={"content": "followup"})
+        await self.tick_after(100)
+        self.assert_running()
+        with patch("super_super_harness.workers.tasks.time.time", return_value=old_idle + 100):
+            await self.result()
+        await self.tick_after(19)
+        self.assert_running()
+        await self.tick_after(21)
+        self.assert_completed()
+
+    async def test_grace_never_finishes_nonempty_background_list(self):
+        await self.snapshot("a")
+        await self.result()
+        await self.tick_after(21)
+        self.assert_running()
+        await self.snapshot()
+        await self.snapshot("b")
+        await self.tick_after(30)
+        self.assert_running()
+
+    async def test_grace_respects_all_delivery_barriers(self):
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.result()
+        self.run.pending_uuids.add("unacknowledged")
+        await self.tick_after(21)
+        self.assert_running()
+        self.run.pending_uuids.clear()
+        for field, value in (("pending", '["held input"]'), ("status", "queued")):
+            self.store.update_task(self.task_id, **{field: value})
+            await self.tick_after(21)
+            self.assertFalse(self.run.ending)
+            self.store.update_task(self.task_id, pending="[]", status="running")
+        for key, value in (("say_pending:", '[{"id":1,"text":"hello"}]'), ("handoff_pending:", "{}")):
+            self.store.set(key + self.task_id, value)
+            await self.tick_after(21)
+            self.assert_running()
+            self.store.unset(key + self.task_id)
+        assignment = self.tasks._assign(self.task_id, "queued assignment")
+        await self.tick_after(21)
+        self.assert_running()
+        self.store.run("UPDATE assignments SET status='doing' WHERE id=?", assignment)
+        await self.tick_after(21)
+        self.assert_completed()
+
+    async def test_child_result_cannot_make_active_root_idle(self):
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.event(type="result", parent_tool_use_id="child", subtype="success", result="child")
+        await self.tick_after(21)
+        self.assert_running()
+
+    async def test_error_result_cannot_leave_old_idle_success_eligible(self):
+        from unittest.mock import AsyncMock
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.result()
+        self.tasks._retry_or_fail = AsyncMock()
+        await self.event(type="result", is_error=True, result="failed")
+        await self.tick_after(21)
+        self.assertIsNone(self.run.idle_result)
+        self.assertEqual(self.store.task(self.task_id)["status"], "running")
+        self.tasks.on_change.assert_not_awaited()
+        self.tasks._retry_or_fail.assert_awaited_once()
+
+    async def test_idle_stuck_alert_is_error_and_only_once(self):
+        self.tasks.cfg.limits["background_grace_seconds"] = 4000
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.result()
+        await self.tick_after(1801)
+        await self.tick_after(1802)
+        self.assertEqual(self.store.task(self.task_id)["status"], "running")
+        self.assertEqual(self.store.one("SELECT severity FROM events WHERE type='worker.completion_stuck'")["severity"], "error")
+        self.assertEqual(self.tasks.on_change.await_count, 1)
+        self.assertEqual(self.tasks.on_change.call_args.args[0], "worker.completion_stuck")
+        self.process.close.assert_not_awaited()
+
+    async def test_stuck_alert_rechecks_input_after_waking_router(self):
+        async def send_followup(*args):
+            self.run.pending_uuids.add("new-input")
+        self.tasks.on_change.side_effect = send_followup
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.result()
+        await self.tick_after(1801)
+        self.assertEqual(self.store.task(self.task_id)["status"], "running")
+        self.assertFalse(self.run.ending)
+        self.assertTrue(self.run.background_pending)
+
+    async def test_empty_snapshot_does_not_finish_spawning_turn_or_retire_inputs(self):
+        assignment = self.tasks._assign(self.task_id, "original")
+        self.store.run("UPDATE assignments SET status='doing' WHERE id=?", assignment)
+        self.run.current_assignment = assignment
+        self.store.set("turn_inputs:" + self.task_id, '["original"]')
+        self.store.set("turn_assignment:" + self.task_id, assignment)
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.result()
+        self.assert_running()
+        self.assertEqual(self.run.current_assignment, assignment)
+        self.assertEqual(self.store.get("turn_inputs:" + self.task_id), '["original"]')
+        self.assertEqual(self.store.one("SELECT status FROM assignments WHERE id=?", assignment)["status"], "doing")
+        await self.notify("a")   # internal input need not carry isReplay or a host UUID
+        self.assert_running()
+        await self.result()
+        self.assert_completed()
+        self.assertIsNone(self.store.get("turn_inputs:" + self.task_id))
+
+    async def test_separate_notifications_need_both_results(self):
+        await self.snapshot("a", "b")
+        await self.snapshot()
+        await self.result()
+        self.assert_running()
+        await self.notify("a", isReplay=True)
+        await self.result()
+        self.assert_running()
+        self.assertEqual(self.run.background_pending, {"b": 1})
+        await self.notify("b", blocks=True)
+        self.assert_running()
+        await self.result()
+        self.assert_completed()
+
+    async def test_batched_notifications_need_one_result_not_one_per_task(self):
+        await self.snapshot("a", "b")
+        await self.result()
+        await self.snapshot()
+        await self.notify("a", "b", blocks=True)
+        self.assert_running()
+        await self.result()
+        self.assert_completed()
+
+    async def test_notification_turn_can_start_more_background_work(self):
+        await self.snapshot("a")
+        await self.result()
+        await self.snapshot()
+        await self.notify("a")
+        await self.snapshot("b")
+        await self.snapshot()
+        await self.result()
+        self.assert_running()
+        await self.notify("b")
+        await self.result()
+        self.assert_completed()
+
+    async def test_reused_task_id_requires_its_new_notification(self):
+        await self.snapshot("a")
+        await self.result()
+        await self.snapshot()
+        await self.notify("a")
+        await self.snapshot("a")   # SendMessage resumed the same background agent
+        await self.snapshot("a")   # duplicate snapshot must not count as another execution
+        await self.snapshot()
+        await self.result()
+        self.assert_running()
+        await self.notify("a")
+        await self.result()
+        self.assert_completed()
+
+    async def test_host_followup_result_before_first_notification_keeps_debt(self):
+        await self.snapshot("a")
+        await self.snapshot()
+        self.run.pending_uuids.add("followup")
+        await self.result()
+        self.assert_running()
+        await self.event(type="user", uuid="followup", isReplay=True, message={"content": "ordinary followup"})
+        await self.result()
+        self.assert_running()
+        self.assertEqual(self.run.background_pending, {"a": 1})
+        self.assertFalse(self.run.host_input)
+        await self.notify("a")
+        await self.result()
+        self.assert_completed()
+
+    async def test_old_notification_after_agent_resume_cannot_pay_new_execution(self):
+        await self.snapshot("a")
+        await self.result()
+        await self.snapshot()
+        await self.snapshot("a")
+        await self.notify("a")   # old execution's notification arrived after resuming
+        await self.snapshot()
+        await self.result()
+        self.assert_running()
+        self.assertEqual(self.run.background_pending, {"a": 1})
+        await self.notify("a")
+        await self.result()
+        self.assert_completed()
+
+    async def test_batched_notifications_of_reused_id_pay_both_executions(self):
+        await self.snapshot("a")
+        await self.result()
+        await self.snapshot()
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.notify("a", "a")
+        await self.result()
+        self.assert_completed()
+
+    async def test_visible_notification_does_not_disable_later_fallback(self):
+        await self.snapshot("a", "b")
+        await self.result()
+        await self.snapshot()
+        await self.notify("a")
+        await self.result()
+        self.assert_running()
+        await self.result()   # B's notification input is not exposed by this stream
+        self.assert_completed()
+
+    async def test_no_notification_input_falls_back_to_later_result(self):
+        await self.snapshot("a")
+        await self.snapshot()
+        await self.result()
+        self.assert_running()
+        await self.result()
+        self.assert_completed()
+
+    async def test_fallback_when_background_ends_after_foreground_result(self):
+        await self.snapshot("a")
+        await self.result()
+        self.assert_running()
+        await self.snapshot()
+        self.assert_running()
+        await self.result()
+        self.assert_completed()
+
+    async def test_snapshot_without_ids_uses_the_same_fallback(self):
+        await self.event(type="system", subtype="background_tasks_changed", tasks=[{}])
+        await self.snapshot()
+        await self.result()
+        self.assert_running()
+        await self.result()
+        self.assert_completed()
+
+    async def test_snapshot_without_ids_can_drain_on_later_notification_result(self):
+        await self.event(type="system", subtype="background_tasks_changed", tasks=[{}])
+        await self.result()
+        await self.snapshot()
+        await self.notify("a")
+        await self.result()
+        self.assert_completed()
+
+    async def test_nested_events_do_not_drain_parent_background_work(self):
+        await self.snapshot("a")
+        await self.result()
+        await self.event(type="system", subtype="background_tasks_changed", tasks=[], parent_tool_use_id="child")
+        await self.notify("a", parent_tool_use_id="child")
+        await self.event(type="result", result="child result", parent_tool_use_id="child")
+        self.assert_running()
+        self.assertTrue(self.run.background)
+        await self.snapshot()
+        await self.notify("a")
+        await self.result()
+        self.assert_completed()
+
+    async def test_host_input_and_tool_output_are_not_internal_notifications(self):
+        await self.snapshot("a")
+        self.run.pending_uuids.add("host-input")
+        await self.notify("a", uuid="host-input", isReplay=True)
+        await self.event(type="user", message={"content": [{"type": "tool_result", "content": self.notification("a")}]})
+        self.assertFalse(self.run.background_notified)
+        self.assertFalse(self.run.pending_uuids)
+
+
 class ProcessCleanup(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         from types import SimpleNamespace
-        from super_super_harness.tasks import Tasks
+        from super_super_harness.workers.tasks import Tasks
         self.store = Store(":memory:")
         self.tasks = Tasks(SimpleNamespace(limits={"max_workers": 1}), self.store, None, None)
         self.task_id = self.store.add_task("task", "brief", "work", None, "session", "", "")
@@ -505,7 +1209,7 @@ class ProcessCleanup(unittest.IsolatedAsyncioTestCase):
         cleanup = self.tasks._end_process(self.task_id)
         self.tasks.closed = True
         self.store.close()
-        with patch("super_super_harness.tasks.procs.sweep") as sweep:
+        with patch("super_super_harness.workers.tasks.procs.sweep") as sweep:
             await asyncio.wait_for(cleanup, 2)
             process.close.assert_awaited_once()
             sweep.assert_called_once_with("test-workspace")
@@ -520,7 +1224,7 @@ class ProcessCleanup(unittest.IsolatedAsyncioTestCase):
         process = SimpleNamespace(close=AsyncMock(side_effect=close))
         self.tasks.live[self.task_id] = SimpleNamespace(process=process, ready=True)
         self.store.update_task(self.task_id, workspace="test-workspace")
-        with patch("super_super_harness.tasks.procs.sweep") as sweep:
+        with patch("super_super_harness.workers.tasks.procs.sweep") as sweep:
             cleanup = asyncio.create_task(self.tasks._end_process(self.task_id))
             await entered.wait()
             self.tasks.closed = True
@@ -567,14 +1271,14 @@ class Releases(unittest.TestCase):
             return SimpleNamespace(returncode=0)
 
         with patch.dict(os.environ, SSHARNESS_HOME="must-not-inherit", TMPDIR="/long/system/temp/path"), \
-             patch("super_super_harness.releases.subprocess.run", side_effect=check_home) as run:
+             patch("super_super_harness.ops.releases.subprocess.run", side_effect=check_home) as run:
             self.assertTrue(releases.run_tests(self.repo))
         args, options = run.call_args
         self.assertEqual(args[0][3:], ["tests.test_workers", "tests.test_router", "tests.test_web",
                                       "tests.test_harness", "tests.test_chat", "tests.test_reminders", "tests.test_avatar",
                                       "tests.test_bus", "tests.test_items", "tests.test_suber", "tests.test_c1", "tests.test_c2",
                                    "tests.test_c5", "tests.test_ui_v2",
-                                   "tests.test_ui_v2_1", "tests.test_routing_graph"])
+                                   "tests.test_ui_v2_1", "tests.test_routing_graph", "tests.test_worker_identity"])
         self.assertFalse(os.path.exists(options["env"]["SSHARNESS_HOME"]))
         self.assertEqual(options["env"]["TMPDIR"], "/tmp")
         self.assertEqual(options["env"]["SSHARNESS_NO_CAFFEINATE"], "1")
@@ -624,9 +1328,23 @@ class QuickConfiguration(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.home = Path(self.temporary.name)
 
+    def test_background_grace_default_and_configuration_validation(self):
+        from super_super_harness.ops import config
+        from tests.support import write_config
+        write_config(self.home, 1, 2)
+        self.assertEqual(config.load(self.home).limits["background_grace_seconds"], 20)
+        for value in ("1", "45", "0", "-1", "true", "1.5", '"20"', "nan", "inf"):
+            with self.subTest(value=value):
+                write_config(self.home, 1, 2, limits="background_grace_seconds = " + value)
+                if value in ("1", "45"):
+                    self.assertEqual(config.load(self.home).limits["background_grace_seconds"], int(value))
+                else:
+                    with self.assertRaisesRegex(ValueError, "background_grace_seconds"):
+                        config.load(self.home)
+
     def test_renamed_home_precedence_without_creating_default_state(self):
         from unittest.mock import patch
-        from super_super_harness import config
+        from super_super_harness.ops import config
         with patch.dict(os.environ, {"HOME": str(self.home)}, clear=True):
             self.assertEqual(config.home_path(), self.home / ".super-super-harness")
             with patch.dict(os.environ, SSHARNESS_HOME=str(self.home / "isolated")):
@@ -646,13 +1364,14 @@ class QuickConfiguration(unittest.TestCase):
         from contextlib import redirect_stdout
         import io
         from unittest.mock import patch
-        from super_super_harness import cli, config, setup
+        from super_super_harness import cli
+        from super_super_harness.ops import config, setup
         with patch.dict(os.environ, SSHARNESS_HOME=str(self.home)):
             args = self.args()
             argv = ["supersuperharness", "init", "--provider", args.provider, "--base-url", args.base_url,
                     "--auth-env", args.auth_env, "--model", args.model, "--context-window", str(args.context_window),
                     "--binary", args.binary]
-            with patch("sys.argv", argv), patch("super_super_harness.setup.getpass.getpass", return_value="fake-key-not-real"), \
+            with patch("sys.argv", argv), patch("super_super_harness.ops.setup.getpass.getpass", return_value="fake-key-not-real"), \
                  redirect_stdout(io.StringIO()) as initialized:
                 self.assertEqual(cli.main(), 0)
             self.assertNotIn("fake-key-not-real", initialized.getvalue())
@@ -692,7 +1411,7 @@ class QuickConfiguration(unittest.TestCase):
         argv = ["supersuperharness", "init", "--provider", args.provider, "--base-url", args.base_url,
                 "--auth-env", args.auth_env, "--model", args.model, "--context-window", str(args.context_window)]
         with patch.dict(os.environ, SSHARNESS_HOME=str(self.home)), patch("sys.argv", argv), \
-                patch("super_super_harness.setup.getpass.getpass", return_value="   "), \
+                patch("super_super_harness.ops.setup.getpass.getpass", return_value="   "), \
                 redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(cli.main(), 1)
         self.assertIn("API Key is empty", errors.getvalue())
@@ -701,7 +1420,7 @@ class QuickConfiguration(unittest.TestCase):
 
     def test_init_rejects_home_in_checkout_for_file_and_environment_credentials(self):
         from unittest.mock import patch
-        from super_super_harness import setup
+        from super_super_harness.ops import setup
         # A worktree's .git is a file; a regular checkout's .git is a directory.
         for git_file in (False, True):
             checkout = self.home / ("worktree" if git_file else "checkout")
@@ -721,7 +1440,7 @@ class QuickConfiguration(unittest.TestCase):
 
     def test_gitignore_covers_private_state_but_not_public_profiles(self):
         from pathlib import Path
-        from super_super_harness import config
+        from super_super_harness.ops import config
         repo = self.home / "ignore-check"
         repo.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
@@ -739,7 +1458,7 @@ class QuickConfiguration(unittest.TestCase):
 
     def test_declared_provider_overrides_builtin_endpoint_auth_models_and_window(self):
         from unittest.mock import patch
-        from super_super_harness import config, setup
+        from super_super_harness.ops import config, setup
         args = self.args(provider="stepplan", model="step-5-preview", context_window=333333,
                          auth_env="ANTHROPIC_API_KEY", key_env="SSHARNESS_TEST_KEY")
         with patch.dict(os.environ, SSHARNESS_TEST_KEY="fake-env-key", ANTHROPIC_AUTH_TOKEN="not-for-this-provider"):
@@ -765,7 +1484,7 @@ class QuickConfiguration(unittest.TestCase):
             self.assertNotIn("fake-env-key", (self.home / "profiles.toml").read_text())
 
     def test_init_existing_profiles_and_migration_are_never_overwritten(self):
-        from super_super_harness import setup
+        from super_super_harness.ops import setup
         setup.initialize(self.home, self.args(), ask_key=lambda _: "fake-original")
         original = (self.home / "profiles.toml").read_bytes()
         with self.assertRaisesRegex(ValueError, "already exists"):
@@ -776,11 +1495,11 @@ class QuickConfiguration(unittest.TestCase):
             setup.migrate(self.home, source)
         self.assertEqual((self.home / "profiles.toml").read_bytes(), original)
         setup.initialize(self.home, self.args(profile="another", provider="another-provider"), ask_key=lambda _: "fake-second")
-        from super_super_harness import config
+        from super_super_harness.ops import config
         self.assertEqual(set(config.load(self.home).profiles), {"default", "another"})
 
     def test_existing_state_without_private_config_requires_migration_not_public_defaults(self):
-        from super_super_harness import config, setup
+        from super_super_harness.ops import config, setup
         # An intentionally invalid DB file proves this path checks existence only.
         (self.home / "router.db").write_bytes(b"not-a-database-do-not-open")
         with self.assertRaisesRegex(ValueError, "migrate"):
@@ -794,7 +1513,7 @@ class QuickConfiguration(unittest.TestCase):
     def test_legacy_migration_survives_install_upgrade_and_rollback_without_keys_or_db(self):
         from pathlib import Path
         from unittest.mock import patch
-        from super_super_harness import config, setup
+        from super_super_harness.ops import config, setup
         from tests.support import write_config
         old = self.home / "old-release"
         old.mkdir()
@@ -841,7 +1560,7 @@ class QuickConfiguration(unittest.TestCase):
             self.assertFalse(cfg.sock.exists())
 
     def test_init_reuses_shared_provider_credentials_and_rejects_implicit_rotation(self):
-        from super_super_harness import config, setup
+        from super_super_harness.ops import config, setup
         setup.initialize(self.home, self.args(), ask_key=lambda _: "fake-original")
         original_key_file = config.load(self.home).providers["custom"].key_file
         setup.initialize(self.home, self.args(profile="second"), ask_key=lambda _: self.fail("shared key must not be requested"))
@@ -855,7 +1574,7 @@ class QuickConfiguration(unittest.TestCase):
     def test_concurrent_init_serializes_read_modify_write_without_losing_profiles(self):
         from concurrent.futures import ThreadPoolExecutor
         import threading
-        from super_super_harness import config, setup
+        from super_super_harness.ops import config, setup
         entered, release = threading.Event(), threading.Event()
         def key_prompt(_):
             entered.set()
@@ -877,7 +1596,7 @@ class QuickConfiguration(unittest.TestCase):
         self.assertEqual(set(config.load(self.home).profiles), {"default", "second"})
 
     def test_new_profile_window_does_not_change_existing_inherited_model_default(self):
-        from super_super_harness import config, setup
+        from super_super_harness.ops import config, setup
         setup.initialize(self.home, self.args(), ask_key=lambda _: "fake-original")
         path = self.home / "profiles.toml"
         raw = setup.read_raw(path)
@@ -891,7 +1610,7 @@ class QuickConfiguration(unittest.TestCase):
         self.assertEqual(cfg.profile("different-window").context_window, 333333)
 
     def test_symlinked_home_or_keys_cannot_store_credentials_inside_a_checkout(self):
-        from super_super_harness import setup
+        from super_super_harness.ops import setup
         checkout = self.home / "checkout"
         checkout.mkdir()
         (checkout / ".git").mkdir()
@@ -910,7 +1629,7 @@ class QuickConfiguration(unittest.TestCase):
                 self.assertNotIn(b"fake-not-to-be-written", path.read_bytes())
 
     def test_invalid_endpoint_and_auth_are_rejected_before_reading_or_writing_credentials(self):
-        from super_super_harness import setup
+        from super_super_harness.ops import setup
         for changes in ({"base_url": "https://fake-secret@example.invalid"}, {"auth_env": "OTHER_AUTH"},
                         {"context_window": 0}, {"base_url": "https://example.invalid/?key=fake-secret"}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
@@ -919,8 +1638,8 @@ class QuickConfiguration(unittest.TestCase):
         self.assertFalse((self.home / "keys").exists())
 
     def test_presets_and_public_defaults_have_no_personal_configuration(self):
-        from super_super_harness import config
-        from super_super_harness.catalog import PRESETS, PLANNED
+        from super_super_harness.ops import config
+        from super_super_harness.ops.catalog import PRESETS, PLANNED
         cfg = config.load(self.home)
         self.assertEqual(set(PRESETS), {"anthropic", "deepseek", "glm", "stepplan", "kimi"})
         self.assertIn("建设中", PLANNED["gpt"])
@@ -937,7 +1656,7 @@ class QuickConfiguration(unittest.TestCase):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import threading
         from unittest.mock import patch
-        from super_super_harness import config, setup
+        from super_super_harness.ops import config, setup
         from tests.support import free_port
         seen = []
         expected = {"auth_env": "ANTHROPIC_AUTH_TOKEN", "model": "declared-model", "status": 200}
@@ -1013,7 +1732,7 @@ class QuickConfiguration(unittest.TestCase):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import threading
         import time
-        from super_super_harness import config, setup
+        from super_super_harness.ops import config, setup
         from tests.support import free_port
         mode = {"status": 200, "stream_error": False}
         class Endpoint(BaseHTTPRequestHandler):
@@ -1073,14 +1792,14 @@ class PrivateFiles(unittest.TestCase):
         from pathlib import Path
         import tempfile
         from unittest.mock import patch
-        from super_super_harness.private_files import atomic_write
+        from super_super_harness.core.private_files import atomic_write
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "profiles.toml"
             original = os.link
             def racing_link(source, destination):
                 path.write_bytes(b"created-by-another-writer")
                 return original(source, destination)
-            with patch("super_super_harness.private_files.os.link", side_effect=racing_link):
+            with patch("super_super_harness.core.private_files.os.link", side_effect=racing_link):
                 with self.assertRaises(FileExistsError):
                     atomic_write(path, b"must-not-overwrite", replace=False)
             self.assertEqual(path.read_bytes(), b"created-by-another-writer")
@@ -1090,9 +1809,9 @@ class PrivateFiles(unittest.TestCase):
         from pathlib import Path
         import tempfile
         from unittest.mock import patch
-        from super_super_harness import config
+        from super_super_harness.ops import config
         from super_super_harness.daemon import Service
-        from super_super_harness.private_files import atomic_write
+        from super_super_harness.core.private_files import atomic_write
         from tests.support import write_config
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder)
@@ -1109,7 +1828,7 @@ class PrivateFiles(unittest.TestCase):
                         raise OSError("injected interruption before rename")
                     return original(source, destination)
                 original = os.replace
-                with patch("super_super_harness.private_files.os.replace", side_effect=replace_failure):
+                with patch("super_super_harness.core.private_files.os.replace", side_effect=replace_failure):
                     with self.assertRaises(OSError):
                         Service(cfg)
                 self.assertEqual(target.read_bytes(), b"")
@@ -1126,7 +1845,7 @@ class PrivateFiles(unittest.TestCase):
                     paths[1].write_bytes(b"")
             existing = home / "private"
             atomic_write(existing, b"original")
-            with patch("super_super_harness.private_files.os.replace", side_effect=OSError("interrupted")):
+            with patch("super_super_harness.core.private_files.os.replace", side_effect=OSError("interrupted")):
                 with self.assertRaises(OSError):
                     atomic_write(existing, b"replacement")
             self.assertEqual(existing.read_bytes(), b"original")
@@ -1138,7 +1857,7 @@ class PrivateFiles(unittest.TestCase):
     def test_private_writes_reject_symlinks_and_do_not_replace_nonempty_corrupt_keys(self):
         from pathlib import Path
         import tempfile
-        from super_super_harness.private_files import atomic_write, persistent_secret
+        from super_super_harness.core.private_files import atomic_write, persistent_secret
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             target, link = root / "target", root / "link"
@@ -1195,7 +1914,7 @@ class Pieces(unittest.TestCase):
     def test_child_env_is_clean_and_blocks_push(self):
         import tempfile
         from pathlib import Path
-        from super_super_harness import config
+        from super_super_harness.ops import config
         from tests.support import write_config
         home = Path(tempfile.mkdtemp(dir="/tmp"))
         write_config(home, 1, 2)

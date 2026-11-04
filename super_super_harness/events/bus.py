@@ -2,9 +2,9 @@
 from html import escape
 import json
 import time
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from .config import BUILTIN_SOURCES, PERMISSIONS, SEVERITIES, THREAD_CHARS, TYPE_CHARS
+from ..ops.config import BUILTIN_SOURCES, PERMISSIONS, SEVERITIES, THREAD_CHARS, TYPE_CHARS
 
 # After the user's rules. Scoped to the internal sources, so an external event cannot pose as one.
 BUILTIN_RULES = (
@@ -99,7 +99,8 @@ class Bus:
             return []
         rows = self.store.all("SELECT s.task_id FROM subscriptions s JOIN tasks t ON t.id=s.task_id WHERE s.thread=? AND t.status IN (%s) "
                               "ORDER BY t.seq" % ",".join("?" * len(ACTIVE)), event["thread"], *ACTIVE)
-        return [row["task_id"] for row in rows if row["task_id"] not in self.tasks.held]
+        unavailable = self.tasks.held | self.tasks.expiring
+        return [row["task_id"] for row in rows if row["task_id"] not in unavailable]
 
     def emit(self, event):
         event = normalize(event)
@@ -151,8 +152,11 @@ class Bus:
     def summary(trigger_id, event):
         text, data = event["text"], event["data"]
         if event["source"] == "worker":
-            spill = "" if len(text) <= SUMMARY else "\n（已截断，完整内容用 task_read 读取）"
-            return "%s（%s）\n%s%s" % (data.get("name", ""), data.get("task_id", ""), text[:SUMMARY], spill)
+            help_request = event["type"] == "worker.help"
+            full = "event_read(trigger_id=%d)" % trigger_id if help_request else "worker_read"
+            spill = "" if len(text) <= SUMMARY else "\n（已截断，完整内容用 %s 读取）" % full
+            target = "\n请求协助，交给 %s" % data["to"] if help_request and data.get("to") else "\n请求协助，请安排同事" if help_request else ""
+            return "%s（%s）%s\n%s%s" % (data.get("name", ""), data.get("worker", ""), target, text[:SUMMARY], spill)
         head = "[trigger_id=%d source=%s type=%s thread=%s severity=%s]" % (
             trigger_id, event["source"], event["type"], event["thread"], event["severity"])
         if event["url"]:
@@ -172,6 +176,16 @@ class Bus:
         return "\n".join(part for part in (head, note, quote(event["url"]), quote(text), "</event>") if part)
 
     # Worker tools
+    def request_help(self, task_id, text, to=None):
+        """Only ask the Router: never create an assignment or contact the other Worker here."""
+        if not isinstance(text, str) or not text.strip() or len(text) > 16000:
+            raise ValueError("help text must be a nonempty string of at most 16000 characters")
+        task = self.store.task(task_id)
+        result = self.emit({"source": "worker", "type": "worker.help", "id": uuid4().hex,
+                            "thread": "task:" + task_id, "text": text,
+                            "data": {"task_id": task_id, "worker": task["code_name"], "name": task["name"][:200], "to": to}})
+        return {"ok": True, "trigger_id": result["trigger_id"], "route": result["route"]}
+
     def threads(self, task_id):
         return [row["thread"] for row in self.store.all("SELECT thread FROM subscriptions WHERE task_id=? ORDER BY thread", task_id)]
 
@@ -200,6 +214,6 @@ class Bus:
                 return {"ok": True}
             self.store.set(key, "1")
             self.store.event("worker", "event.handed_back", task_id, trigger_id=trigger_id, reason=reason)
-            self.router.submit("event", "%s（%s）退回这条事件，理由：%s\n%s" % (task["name"][:200], task_id, reason, self.summary(trigger_id, event)),
+            self.router.submit("event", "%s（%s）退回这条事件，理由：%s\n%s" % (task["name"][:200], task["code_name"], reason, self.summary(trigger_id, event)),
                                kind="event.handed_back", task_id=task_id)
         return {"ok": True}

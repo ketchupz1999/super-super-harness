@@ -13,7 +13,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from super_super_harness import cli, config
+from super_super_harness import cli
+from super_super_harness.ops import config
 from super_super_harness.adapters import Harness, HarnessProcess, get_harness, register
 from super_super_harness.daemon import Service
 from tests.fake_harness import FakeHarness
@@ -115,7 +116,7 @@ class HomePermissionsTests(unittest.TestCase):
         return service
 
     def test_existing_home_is_private_before_private_state_is_opened(self):
-        from super_super_harness.store import Store
+        from super_super_harness.core.store import Store
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder)
             home.chmod(0o755)
@@ -160,7 +161,7 @@ class ProfileBoundaryTests(unittest.TestCase):
                 config.Profile("test", "claude-code", "custom", "test-model", location=location)
 
     def test_private_config_rejects_unsupported_profile_boundaries(self):
-        from super_super_harness import setup
+        from super_super_harness.ops import setup
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder)
             write_config(home, 1, 2)
@@ -213,7 +214,7 @@ class PublicConfigurationCommandTests(unittest.TestCase):
                               env=dict(os.environ, SSHARNESS_HOME=str(home), SSHARNESS_NO_CAFFEINATE="1"))
 
     def test_profile_boundary_errors_are_actionable_in_every_cli_path_without_secrets(self):
-        from super_super_harness import setup
+        from super_super_harness.ops import setup
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder)
             write_config(home, 1, 2)
@@ -422,7 +423,7 @@ class SayCommandTests(unittest.TestCase):
 class ServePreparationTests(unittest.TestCase):
     def test_failed_ensure_is_one_safe_error_and_leaves_no_pid_or_listener(self):
         import sys
-        from super_super_harness import setup
+        from super_super_harness.ops import setup
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder)
             write_config(home, 1, 2)
@@ -482,7 +483,7 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(service.store.one("SELECT status FROM messages WHERE id=?", message_id)["status"], "confirmed")
                 service.store.run("UPDATE messages SET status='done' WHERE id=?", message_id)
                 # A local PID is optional; readiness must be enough for upgrade health checks.
-                from super_super_harness import releases
+                from super_super_harness.ops import releases
                 status = await service.dispatch(("owner", None), "status", {}, None)
                 self.assertTrue(status["router"]["ready"])
                 self.assertIsNone(status["router"]["pid"])
@@ -529,13 +530,16 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(("headless", "work", True), fake.calls)
                 self.assertTrue(await service.router._probe("main", deep=True))
                 # Reads retain the original Harness even after its Profile was removed.
+                brief = service.store.task(task_id)["brief"]
+                self.assertIn("[Item misc-", brief)
+                self.assertTrue(brief.endswith("the brief"))
                 del cfg.profiles["work"]
-                self.assertEqual(service.task_detail(task_id, None, 20)[0]["text"], "the brief")
+                self.assertEqual(service.task_detail(task_id, None, 20)[0]["text"], " ".join(brief.split()))
                 cfg.profiles["work"] = replace(cfg.profile("other"), name="work", harness="claude-code")
-                self.assertEqual(service.task_detail(task_id, None, 20)[0]["text"], "the brief")
+                self.assertEqual(service.task_detail(task_id, None, 20)[0]["text"], " ".join(brief.split()))
                 detail = await service.web.detail(task_id, {})
                 self.assertEqual(detail["source"], "transcript")
-                self.assertEqual(detail["timeline"][0]["text"], "the brief")
+                self.assertEqual(detail["timeline"][0]["text"], brief)
                 cfg.profiles["work"] = replace(cfg.profile("other"), name="work")
                 developer = await service.web.developer()
                 self.assertTrue(all(p["healthy"] for p in developer["providers"]))

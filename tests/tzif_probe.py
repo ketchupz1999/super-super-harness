@@ -9,7 +9,7 @@ import tempfile
 from unittest.mock import patch
 import zoneinfo
 
-from super_super_harness.reminders import LibcZone, local_zone, time_context
+from super_super_harness.events.reminders import LibcZone, local_zone, time_context
 
 
 def main(mode):
@@ -52,7 +52,7 @@ def main(mode):
             assert zone.utcoffset(datetime(2026, 1, 1)) == \
                 zoneinfo.ZoneInfo.from_file(io.BytesIO(data), key=key).utcoffset(datetime(2026, 1, 1))
             path.write_bytes(data[:-1])
-            with patch('super_super_harness.reminders.ZoneInfo') as parser:
+            with patch('super_super_harness.events.reminders.ZoneInfo') as parser:
                 assert isinstance(local_zone(), LibcZone)
                 parser.assert_not_called()
                 parser.from_file.assert_not_called()

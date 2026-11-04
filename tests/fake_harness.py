@@ -82,7 +82,7 @@ class FakeProcess:
     async def _turn(self, text, uuid):
         self.adapter.sessions.setdefault(self.session_id, []).append(text)
         await self.on_event({"type": "user", "isReplay": True, "uuid": uuid})
-        if text.startswith("WAIT"):
+        if "WAIT" in text.split():
             await self.interrupted.wait()
         if self.interrupted.is_set():
             self.interrupted.clear()

@@ -78,6 +78,12 @@ class RouterFiles:
                 atomic_write(path, MEMORY_STUB, replace=False)
 
 
+class WorkerNotes(RouterFiles):
+    """Workspace-root notes, outside the repository and retained while dormant."""
+    names = ('notes',)
+    label = 'Worker notes'
+
+
 class ItemNotes(RouterFiles):
     """SSHARNESS_HOME/items/<code>/notes.md with the same atomic write and version check."""
     names = ('notes',)

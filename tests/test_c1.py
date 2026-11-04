@@ -4,13 +4,15 @@ import shutil
 import subprocess
 import unittest
 
+from tests.support import PAGE
+
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is needed for frontend regression tests")
 class PageSkeleton(unittest.TestCase):
     def run_render_test(self, name):
         root = Path(__file__).resolve().parent.parent
         result = subprocess.run(["node", str(root / "tests/web_regressions.js"),
-                                 str(root / "super_super_harness/web/index.html"), name],
+                                 str(PAGE), name],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

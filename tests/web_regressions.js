@@ -77,7 +77,7 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
 (async()=>{
   switch(process.argv[3]) {
     case 'routing-layout': {
-      run(`data.items=[{code:'one',name:'Web <tag>'},{code:'two',name:'Research'}];data.tasks=Array.from({length:6},(_,i)=>({id:'t'+(i+1),worker_name:'Name '+i,name:'Task <tag>',item:i<3?'one':'two',model:'gpt-6-astra',status:i===5?'waiting_deps':'running',wait_for:i===5?[{task_id:'t2',satisfied:false}]:[]}));renderCommunication();`);
+      run(`data.items=[{code:'one',name:'Web <tag>'},{code:'two',name:'Research'}];data.tasks=Array.from({length:6},(_,i)=>({id:'t'+(i+1),code_name:'Name '+i,name:'Task <tag>',item:i<3?'one':'two',model:'gpt-6-astra',status:i===5?'waiting_deps':'running',wait_for:i===5?[{task_id:'t2',satisfied:false}]:[]}));renderCommunication();`);
       for(const panel of [true,false]) {
         const plan=JSON.parse(run(`JSON.stringify(routingPlan(data.tasks,${panel},${panel?348:1000}))`));
         assert.equal(plan.nodes.length,6);assert.equal(plan.groups.length,2);
@@ -217,7 +217,7 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       break;
     }
     case 'v21-cards-and-chips': {
-      run(`data.tasks=[];messages=new Map([[1,{id:1,role:'router',text:'Confirmed <tag>',tasks:['t9'],workers:[{id:'t9',worker_name:'Backend <name>',name:'System <pages>',status:'running'}],steps:[{name:'mcp__router__reminder_add',hidden:true},{name:'mcp__router__reply'}],reminders:[{id:'r1',kind:'notify',next_time:'Tomorrow <time>',text:'原文 <script> & details',cron:'0 9 * * *'}]}]]);renderThread(true);`);
+      run(`data.tasks=[];messages=new Map([[1,{id:1,role:'router',text:'Confirmed <tag>',tasks:['t9'],workers:[{id:'t9',code_name:'Backend <name>',name:'System <pages>',status:'running'}],steps:[{name:'mcp__router__reminder_add',hidden:true},{name:'mcp__router__reply'}],reminders:[{id:'r1',kind:'notify',next_time:'Tomorrow <time>',text:'原文 <script> & details',cron:'0 9 * * *'}]}]]);renderThread(true);`);
       const markup=elements.get('thread').innerHTML;
       assert.match(markup,/class="chip worker-chip" data-task="t9"/);assert.match(markup,/<svg class="robot/);
       assert.match(markup,/<b>Backend &lt;name&gt;<\/b><small>· System &lt;pages&gt;<\/small>/);
@@ -225,7 +225,7 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       assert.match(markup,/Added a reminder · notify/);assert.doesNotMatch(markup,/Using reminder_add|tool calls|actions ▸|<script>|<name>|<pages>/);
       const opened=[];context.opened=opened;run('openTask=id=>opened.push(id);');
       await listeners.click({target:{closest:()=>({dataset:{task:'t9'}})}});assert.deepEqual(opened,['t9']);
-      run(`data.tasks=[{id:'t9',worker_name:'Updated identity',name:'System pages'}];renderThread();`);
+      run(`data.tasks=[{id:'t9',code_name:'Updated identity',name:'System pages'}];renderThread();`);
       assert.match(elements.get('thread').innerHTML,/Updated identity/,'Identity participates in the render fingerprint');
       break;
     }
@@ -239,24 +239,23 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       break;
     }
     case 'v21-name-priority': {
-      run(`data.tasks=[{id:'t9',name:'Task',worker_name:'Server identity',model:'opus',status:'running'}];renderActivity();renderTasks();renderCommunication();`);
+      run(`data.tasks=[{id:'t9',name:'Task',code_name:'Server identity',model:'opus',status:'running'}];renderActivity();renderTasks();renderCommunication();`);
       assert.equal(run(`workerName('t9')`),'Server identity');
       for(const id of ['taskList','chatRoutingRows','routeLanes']) assert.match(elements.get(id).innerHTML,/Server identity/);
-      const markup=run(`drawerOverview({upstream:[{id:'t1001',worker_name:'Remote <name>',name:'Outside state'}]})`);
+      const markup=run(`drawerOverview({upstream:[{id:'t1001',code_name:'Remote <name>',name:'Outside state'}]})`);
       assert.match(markup,/Remote &lt;name&gt;/);assert.doesNotMatch(markup,/<name>/);
       break;
     }
     case 'v2-identity': {
-      assert.equal(run('new Set(WORKER_NAMES).size'),24);
-      assert.equal(run("workerName('t1')"),'Nova');assert.equal(run("workerName('t24')"),'Wren');assert.equal(run("workerName('t25')"),'Nova');
-      assert.equal(run("workerName('t9')"),'Iris');
+      for(const id of ['t1','t24','t25']) assert.equal(run(`workerName('${id}')`),'Unknown Worker');
+      assert.equal(run("workerName({id:'t9',code_name:'Chosen'})"),'Chosen');
       assert.equal(run("elapsed({status:'waiting',state_since:1000,activity:{run_started:100,run_ended:160}})"),'1m 00s','Needs-you duration is the actual run, not time waiting for the user');
       assert.equal(run("elapsed({status:'queued',created:1,activity:{run_started:null,run_ended:null}})"),'0s');
       for(const [model,harness,expected] of [['Claude Opus','claude-code','claude'],['sonnet','claude-code','claude'],['haiku','claude-code','claude'],['gpt-6-astra','claude-code','chatgpt'],['sol','claude-code','chatgpt'],['gpt-6','codex','codex'],['Muse','claude-code','muse'],['unknown','other',null]]) {
         assert.equal(run(`workerCharacter(${JSON.stringify({id:'t9',model,harness})})`),expected);
         assert.equal(run(`workerCharacter(${JSON.stringify({id:'t1',model,harness})})`),expected,'Task sequence never chooses the character');
       }
-      run("data.characters=[{id:'claude',frameWidth:256,frameHeight:256}];data.harness_icon='/api/characters/harness-claude-code.png?v=1';data.tasks=[{id:'t9',name:'Pages',model:'opus',harness:'claude-code',status:'running'}];renderActivity();renderTasks();renderCommunication();");
+      run("data.characters=[{id:'claude',frameWidth:256,frameHeight:256}];data.harness_icon='/api/characters/harness-claude-code.png?v=1';data.tasks=[{id:'t9',code_name:'Iris',name:'Pages',model:'opus',harness:'claude-code',status:'running'}];renderActivity();renderTasks();renderCommunication();");
       for(const id of ['taskList','chatRoutingRows','routeLanes']) {
         const markup=elements.get(id).innerHTML;assert.match(markup,/Iris/);assert.match(markup,/opus/);assert.match(markup,/Claude Code/);assert.match(markup,/data-character="claude"/);assert.match(markup,/data-harness-icon/);
       }
@@ -264,6 +263,17 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       run('data.characters=[];data.harness_icon=null;');assert.match(run("workerAvatar({id:'t1',model:'opus',status:'running'})"),/^<svg/);
       assert.doesNotMatch(run("harnessTag({harness:'claude-code'})"),/<img/);
       assert.equal(run("workerCard(data.tasks[0],'lane')===laneMarkup(data.tasks[0])"),true,'Both Routing views share the card renderer');
+      run("state.tableFilter='ended';data.tasks=[{id:'t9',code_name:'Sleeper',status:'dormant',model:'opus'}];renderTasks();");
+      assert.equal(run("safeStatus('dormant')"),'dormant');assert.match(elements.get('taskList').innerHTML,/Dormant/);
+      assert.equal(run("robotState({status:'dormant'})"),'dormant');
+      assert.match(html,/\.robot\[data-robot="dormant"\], \.worker-sprite\[data-robot="dormant"\] \{ opacity:\.5; \}/);
+      assert.equal(run("workerSub({id:'t9',name:'Pages',role:'Entries <safe>'})"),'Pages · Entries &lt;safe&gt;');
+      assert.equal(run("workerSub({id:'t9',name:'Pages'})"),'Pages');
+      for(const id of ['taskList','chatRoutingRows','routeLanes']) assert.doesNotMatch(elements.get(id).innerHTML.replace(/<[^>]*>/g,''),/\bt\d+\b/);
+      assert.doesNotMatch(script,/workerNumber|WORKER_NAMES/);
+      const requests=[...script.matchAll(/api\(`workers\/[^`]+`/g)].map(match=>match[0]);
+      assert.equal(requests.length,4,'Detail, question preflight, actions and diff all use immutable ids');
+      assert.ok(requests.every(request=>request.includes('by=id')));
       break;
     }
     case 'v2-sprites': {
@@ -283,16 +293,16 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       break;
     }
     case 'v2-inspect': {
-      run(`state.task='t9';detail={task:{id:'t9',name:'Pages <script>',model:'gpt-6-astra',harness:'claude-code',session_id:'session-123',status:'running',upstream:[],downstream:[],activity:{run_started:100}},timeline:[{kind:'received',text:'First message',time:100},{kind:'tool_call',tool:'Bash',text:'{"command":"printf safe"}',time:101},{kind:'said',text:'**Result** <script>bad</script>',time:102}],total:3,previous_offset:null,offset:0};renderModal(true);`);
+      run(`state.task='t9';detail={task:{id:'t9',code_name:'Iris',name:'Pages <script>',model:'gpt-6-astra',harness:'claude-code',session_id:'session-123',status:'running',upstream:[],downstream:[],activity:{run_started:100}},timeline:[{kind:'received',text:'First message',time:100},{kind:'tool_call',tool:'Bash',text:'{"command":"printf safe"}',time:101},{kind:'said',text:'**Result** <script>bad</script>',time:102}],total:3,previous_offset:null,offset:0};renderModal(true);`);
       const markup=elements.get('modalBox').innerHTML;
       for(const label of ['Iris','gpt-6-astra','Claude Code','session-123','Resume in terminal','More','Interrupt','Stop','Message Iris']) assert.ok(markup.includes(label),label);
       assert.ok(markup.indexOf('First message')<markup.indexOf('Bash · printf safe'));assert.ok(markup.indexOf('Bash · printf safe')<markup.indexOf('<strong>Result</strong>'));
       assert.match(markup,/<details class="session-entry session-tool"[^>]* >/, 'Tools begin folded');
       assert.match(markup,/&lt;script&gt;/);assert.doesNotMatch(markup,/<script>|&quot;command&quot;|claude --resume/);
       const copied=[];context.navigator={clipboard:{writeText:async text=>copied.push(text)}};
-      await run('copyWorkerSession()');await run('copyWorkerSession(true)');assert.deepEqual(copied,['session-123','supersuperharness open t9']);
+      await run('copyWorkerSession()');await run('copyWorkerSession(true)');assert.deepEqual(copied,['session-123','supersuperharness open Iris']);
       assert.match(elements.get('sessionNotice').textContent,/Exit to hand it back/);
-      context.navigator.clipboard.writeText=async()=>{throw Error('Denied');};await run('copyWorkerSession(true)');assert.match(elements.get('sessionNotice').textContent,/Copy manually: supersuperharness open t9/);
+      context.navigator.clipboard.writeText=async()=>{throw Error('Denied');};await run('copyWorkerSession(true)');assert.match(elements.get('sessionNotice').textContent,/Copy manually: supersuperharness open Iris/);
       run(`state.diff={scope:'committed',text:'<script>diff</script>'};detail.task.progress='New progress';renderModal();`);
       assert.match(elements.get('modalBox').innerHTML,/id="workerDiff" ><h4>committed/);assert.match(elements.get('modalBox').innerHTML,/&lt;script&gt;diff&lt;\/script&gt;/);
       const more=new Element('drawerMenuToggle'), close=new Element('drawerClose'), send=new Element('taskSend');
@@ -334,8 +344,10 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       assert.equal(run("flights.filter(f=>f[2]==='dispatch').length"),2,'Accepted send is deduplicated by durable event ID');
       run("rows[0].steps.push({id:11,name:'task.message',text:'{bad'});rows[0].tasks=['t1','t2'];reconcileTraffic(rows,new Set(['message']),traffic.epoch);");
       assert.equal(run("flights.filter(f=>f[2]==='dispatch').length"),2,'Do not guess a destination in ambiguous turns');
-      run("rows[0].steps.push({id:12,name:'mcp__router__task_send',text:JSON.stringify({input:JSON.stringify({task_id:'t2',text:'Unique'})})},{id:13,name:'task.message',text:JSON.stringify({text:'Unique'})});reconcileTraffic(rows,new Set(['message']),traffic.epoch);");
+      run("rows[0].workers=[{id:'t2',code_name:'Pixel'}];rows[0].steps.push({id:12,name:'mcp__router__worker_assign',text:JSON.stringify({input:JSON.stringify({worker:'pIxEl',text:'Unique'})})},{id:13,name:'task.message',text:JSON.stringify({text:'Unique'})});reconcileTraffic(rows,new Set(['message']),traffic.epoch);");
       assert.equal(run("flights.filter(f=>f[0]==='t2' && f[2]==='dispatch').length"),1);
+      run("rows[0].workers[0].code_name='Arch';rows[0].steps.push({id:14,name:'mcp__router__worker_say',task_id:'t2',text:JSON.stringify({input:JSON.stringify({worker:'Pixel',text:'Renamed'})})},{id:15,name:'task.message',text:JSON.stringify({text:'Renamed'})});reconcileTraffic(rows,new Set(['message']),traffic.epoch);");
+      assert.equal(run("flights.filter(f=>f[0]==='t2' && f[2]==='dispatch').length"),2,'Durable targets survive renamed tool inputs');
       break;
     }
     case 'c3-reports': {
@@ -422,7 +434,7 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
     }
     case 'c4-routing': {
       const now=Date.now()/1000;
-      run(`connected=true;data.router={model:'main-model',avatar:{name:'Router',state:'working'}};data.items=[{code:'ui-1',name:'UI'}];data.tasks=[{id:'t1',name:'Build <it>',status:'running',model:'m',item:'ui-1',progress:'Bash {"command":"x"}',wait_for:[],activity:{run_started:${now}-90,reported:'',tool:{name:'Bash',input:'{}'},exchange:{type:'report.progress',text:'Half way',time:${now}-5}}},{id:'t2',name:'Ask',status:'waiting',model:'m',question:'Ship <it>?',wait_for:[]},{id:'t3',name:'Summary',status:'waiting_deps',model:'m',wait_for:[{task_id:'t1',satisfied:false},{task_id:'t9',satisfied:true}]},{id:'t4',name:'Paused',status:'interrupted',model:'m',wait_for:[]},{id:'t5',name:'Old',status:'completed',model:'m',ended:${now},wait_for:[]},{id:'t6',name:'Broke',status:'failed',model:'m',ended:${now},wait_for:[]},{id:'t7',name:'Yesterday',status:'completed',model:'m',ended:${now}-172800,wait_for:[]}];renderCommunication();`);
+      run(`connected=true;data.router={model:'main-model',avatar:{name:'Router',state:'working'}};data.items=[{code:'ui-1',name:'UI'}];data.tasks=[{id:'t1',code_name:'Nova',name:'Build <it>',status:'running',model:'m',item:'ui-1',progress:'Bash {"command":"x"}',wait_for:[],activity:{run_started:${now}-90,reported:'',tool:{name:'Bash',input:'{}'},exchange:{type:'report.progress',text:'Half way',time:${now}-5}}},{id:'t2',name:'Ask',status:'waiting',model:'m',question:'Ship <it>?',wait_for:[]},{id:'t3',name:'Summary',status:'waiting_deps',model:'m',wait_for:[{task_id:'t1',satisfied:false},{task_id:'t9',satisfied:true}]},{id:'t4',name:'Paused',status:'interrupted',model:'m',wait_for:[]},{id:'t5',name:'Old',status:'completed',model:'m',ended:${now},wait_for:[]},{id:'t6',name:'Broke',status:'failed',model:'m',ended:${now},wait_for:[]},{id:'t7',name:'Yesterday',status:'completed',model:'m',ended:${now}-172800,wait_for:[]}];renderCommunication();`);
       const map=elements.get('commMap').innerHTML, lanes=elements.get('routeLanes').innerHTML, ended=elements.get('routingEnded').innerHTML;
       for(const id of ['t1','t2','t3']) assert.ok(map.includes(`data-comm-edge="${id}"`) && lanes.includes(`data-task="${id}"`));
       for(const id of ['t4','t5','t6','t7']) assert.ok(!lanes.includes(`data-task="${id}"`));
@@ -451,7 +463,7 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       break;
     }
     case 'c4-drawer': {
-      run(`data.profiles=[{name:'work',model:'Model'}];data.items=[{code:'ui-1',name:'UI'}];state.task='t2';state.reportOpen=false;detail={task:{id:'t2',name:'Review',model:'Model',profile:'work',item:'ui-1',status:'completed',progress:'Read {"file_path": "/a/b.md"}',report:'**Done**: shipped it.\\n\\n## Details\\n<script>x</script> more',brief:'Brief',branch:'task/t2',upstream:[],downstream:[],activity:{run_started:100,reported:'',tool:null,exchange:null},ended:160},timeline:[],total:0,next_offset:null};renderModal(true);`);
+      run(`data.profiles=[{name:'work',model:'Model'}];data.items=[{code:'ui-1',name:'UI'}];state.task='t2';state.reportOpen=false;detail={task:{id:'t2',name:'Review',model:'Model',profile:'work',item:'ui-1',status:'completed',progress:'Read {"file_path": "/a/b.md"}',report:'**Done**: shipped it.\\n\\n## Details\\n<script>x</script> more',brief:'Brief',branch:'w/pixel',upstream:[],downstream:[],activity:{run_started:100,reported:'',tool:null,exchange:null},ended:160},timeline:[],total:0,next_offset:null};renderModal(true);`);
       const markup=elements.get('modalBox').innerHTML;
       assert.match(markup,/<div class="message-text markdown report-lead"><p><strong>Done<\/strong>: shipped it\.<\/p><\/div>/,'Only the conclusion paragraph is open');
       assert.match(markup,/<details id="drawerReport" class="drawer-report" ><summary id="drawerReportToggle">Full report/);
@@ -499,9 +511,9 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       assert.match(robot,/<g class="robot-badge ask">/);assert.match(robot,/class="robot tone-\d"/);assert.doesNotMatch(robot,/onload|ui-1/,'Only fixed shapes and a derived colour class');
       assert.match(run(`robotMarkup({id:'t1',status:'running'})`),/class="robot tone-none" data-robot="running"/);
       assert.match(html,/\.robot\[data-robot="pending"\] \{ opacity:\.45; \}/);assert.match(html,/prefers-reduced-motion:reduce\) \{ \.robot \* \{ animation:none !important; \} \}/);
-      run(`data.tasks=[{id:'t9',name:'System pages',status:'running',model:'opus',progress:'Read {"file_path": "/w/a.md"}'}];renderActivity();`);
+      run(`data.tasks=[{id:'t9',code_name:'Iris',name:'System pages',status:'running',model:'opus',progress:'Read {"file_path": "/w/a.md"}'}];renderActivity();`);
       const card=run('workerCard(data.tasks[0])');
-      assert.match(card,/<svg class="robot[^>]*data-robot="running"/);assert.match(card,/<b>Iris<\/b>/);assert.match(card,/<span class="model-tag" title="opus">opus<\/span>/);assert.match(card,/Reading a\.md/);assert.match(card,/System pages · t9/);assert.match(card,/data-task="t9"/);
+      assert.match(card,/<svg class="robot[^>]*data-robot="running"/);assert.match(card,/<b>Iris<\/b>/);assert.match(card,/<span class="model-tag" title="opus">opus<\/span>/);assert.match(card,/Reading a\.md/);assert.match(card,/<small class="mini-sub">System pages<\/small>/);assert.match(card,/data-task="t9"/);
       run(`messages=new Map([[1,{id:1,role:'router',text:'Hi',created:1,channel:'web'}]]);renderThread(true);`);
       assert.match(elements.get('thread').innerHTML,/<span class="avatar router-mini" aria-hidden="true"><\/span><div class="msg-body"><div class="msg-meta"><b>Router<\/b>/);
       break;
@@ -551,11 +563,26 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
     case 'c2-groups': {
       run(`data.items=[{code:'ui-1',name:'UI',tasks:['t1','t2']},{code:'empty-1',name:'Empty',tasks:[]}];data.tasks=[{id:'t1',name:'Done',status:'completed',item:'ui-1',wait_for:[]},{id:'t2',name:'Review',status:'waiting_deps',item:'ui-1',wait_for:[{task_id:'t1',satisfied:true}]},{id:'t3',name:'Loose',status:'running',item:null,wait_for:[]}];`);
       assert.deepEqual(JSON.parse(run('JSON.stringify(buildRunGroups().map(g=>[g.code,g.tasks.map(t=>t.id)]))')),[['ui-1',['t1','t2']],['empty-1',[]],[null,['t3']]]);
-      run('renderCommunication();');
+      run("data.tasks.forEach((t,i)=>t.code_name=['Nova','Pixel','Echo'][i]);renderCommunication();");
       const markup=elements.get('itemGraph').innerHTML;
+      assert.doesNotMatch(markup.replace(/<[^>]*>/g,''),/\bt\d+\b/);
+      assert.match(markup,/Nova → Pixel/);
       assert.match(markup,/data-item="ui-1"/);assert.match(markup,/Unassigned/);assert.match(markup,/data-dependency="t1:t2"/);
       assert.match(markup,/data-task="t1"/,'Completed upstreams remain visible');
       assert.match(markup,/No Workers in this item yet/);
+      const node=new Element('graph-worker'), edge=new Element('graph-edge'), fields=new Map();
+      node.dataset={task:'t1',role:'worker'};edge.dataset={dependency:'t1:t2'};
+      node.querySelector=selector=>{if(!fields.has(selector)) fields.set(selector,{});return fields.get(selector);};
+      edge.querySelector=()=>{if(!fields.has('edge-title')) fields.set('edge-title',{});return fields.get('edge-title');};
+      elements.get('itemGraph').querySelectorAll=selector=>selector==='.comm-node'?[node]:selector==='[data-dependency]'?[edge]:[];
+      run("const previousMap=lastMap;data.tasks[0].code_name='Arch';renderItemGraph();");
+      assert.equal(run('previousMap===lastMap'),true,'Rename does not change graph topology');
+      assert.equal(fields.get('.comm-code').textContent,'Arch');
+      assert.match(fields.get('title').textContent,/Arch/);assert.doesNotMatch(fields.get('title').textContent,/\bt1\b/);
+      assert.match(fields.get('edge-title').textContent,/Arch → Pixel/);
+      run("data.items=[{code:'up-1',name:'Upstream',tasks:['t1']},{code:'down-1',name:'Downstream',tasks:['t2']}];data.tasks=[{id:'t2',code_name:'Pixel',name:'Review',item:'down-1',status:'waiting_deps',wait_for:[{task_id:'t1',code_name:'Gate',name:'Entry work',satisfied:false}]}];renderItemGraph();");
+      assert.equal(fields.get('.comm-code').textContent,'Gate','Dependency metadata enriches an earlier anonymous item placeholder');
+      assert.match(fields.get('edge-title').textContent,/Gate → Pixel/);
       break;
     }
     case 'c2-layout': {
@@ -574,10 +601,11 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       break;
     }
     case 'c2-references': {
-      run(`data.items=[{code:'ui-1',name:'UI',tasks:['t2']}];data.tasks=[{id:'t1',name:'External',item:'ops-1',status:'completed',wait_for:[]},{id:'t2',name:'Worker',item:'ui-1',status:'waiting_deps',wait_for:[{task_id:'t1',satisfied:true},{task_id:'t99',satisfied:false}]}];`);
+      run(`data.items=[{code:'ui-1',name:'UI',tasks:['t2']}];data.tasks=[{id:'t1',name:'External',item:'ops-1',status:'completed',wait_for:[]},{id:'t2',name:'Worker',item:'ui-1',status:'waiting_deps',wait_for:[{task_id:'t1',satisfied:true},{task_id:'t99',code_name:'Remote',name:'Outside state',satisfied:false}]}];`);
       const group=JSON.parse(run('JSON.stringify(buildRunGroups()[0])'));
       assert.equal(group.references.find(t=>t.id==='t1').name,'External');
       assert.equal(group.references.find(t=>t.id==='t99').missing,true);
+      assert.equal(group.references.find(t=>t.id==='t99').code_name,'Remote');
       run('renderCommunication();');assert.match(elements.get('itemGraph').innerHTML,/External upstream/);assert.match(elements.get('itemGraph').innerHTML,/Not loaded/);
       const cycle=JSON.parse(run("JSON.stringify(layoutRunGroup({tasks:[{id:'a',wait_for:[{task_id:'b'}]},{id:'b',wait_for:[{task_id:'a'}]}],references:[]},2))"));
       assert.equal(cycle.cycle,true);assert.equal(cycle.nodes.length,2);
@@ -599,7 +627,7 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       break;
     }
     case 'c2-drawer': {
-      run(`data.profiles=[{name:'work',model:'Model'}];state.task='t2';detail={task:{id:'t2',name:'Review',model:'Model',profile:'work',status:'waiting',progress:'Checked entry',question:'Continue?',question_id:4,options:['Yes'],report:'Saved result',brief:'Brief',branch:'task/t2',upstream:[{id:'t1',name:'Build',status:'completed',satisfied:true}],downstream:[{id:'t3',name:'Report',status:'waiting_deps',satisfied:false}]},timeline:[],total:0,next_offset:null};renderModal(true);`);
+      run(`data.profiles=[{name:'work',model:'Model'}];state.task='t2';detail={task:{id:'t2',name:'Review',model:'Model',profile:'work',status:'waiting',progress:'Checked entry',question:'Continue?',question_id:4,options:['Yes'],report:'Saved result',brief:'Brief',branch:'w/pixel',upstream:[{id:'t1',name:'Build',status:'completed',satisfied:true}],downstream:[{id:'t3',name:'Report',status:'waiting_deps',satisfied:false}]},timeline:[],total:0,next_offset:null};renderModal(true);`);
       const markup=elements.get('modalBox').innerHTML;
       for(const text of ['Checked entry','Saved result','Continue?','Waits on','Unblocks','Build','Report','More','id="drawerMenu"','Answer in chat']) assert.ok(markup.includes(text));
       assert.match(markup,/data-confirm="t2"/);assert.match(markup,/data-task="t1"/);assert.match(markup,/data-action="stop"/);assert.match(markup,/data-action="model"/);assert.match(markup,/data-diff="1"/);
@@ -718,13 +746,13 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
     }
     case 'c1-tasks': {
       run(`data.tasks=statuses.map((status,i)=>({id:'t'+i,name:'Task '+i,status,progress:'progress '+i,question:status==='waiting'?'Question & confirm':'',updated:1700000000+i}));data.counts=Object.fromEntries(statuses.map(s=>[s,1]));data.tasks_truncated=true;state.query='';state.tableFilter='active';renderTasks();`);
-      assert.equal(run('statuses.length'),8);
-      const groups={active:['running','queued','waiting_deps','interrupted'],waiting:['waiting'],ended:['completed','failed','stopped']};
+      assert.equal(run('statuses.length'),9);
+      const groups={active:['running','queued','waiting_deps','interrupted'],waiting:['waiting'],ended:['completed','dormant','failed','stopped']};
       for(const [filter,members] of Object.entries(groups)) {
         run(`state.tableFilter='${filter}';renderTasks();`);
         assert.deepEqual(JSON.parse(run('JSON.stringify(filteredTasks().map(t=>t.status).sort())')),[...members].sort());
       }
-      assert.equal(Object.values(groups).flat().length,8,'Every real status belongs to exactly one filter');
+      assert.equal(Object.values(groups).flat().length,9,'Every real status belongs to exactly one filter');
       for(const query of ['TASK 4','t4','progress 4']) {
         run(`state.tableFilter='active';state.query='${query}';renderTasks();`);
         assert.equal(run('filteredTasks()[0].id'),'t4'); assert.equal(run('filteredTasks().length'),1);
@@ -768,7 +796,7 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       const calls=[];context.fetch=async(path,opts)=>{calls.push([path,JSON.parse(opts.body)]);return {ok:false,status:409,json:async()=>({error:'Task changed'})};};
       run("data.tasks=[{id:'t2',name:'Confirm',status:'waiting'}];");
       await listeners.click({target:{closest:()=>({dataset:{reply:'t2'}})}});
-      assert.equal(calls[0][0],'/api/tasks/t2/send');
+      assert.equal(calls[0][0],'/api/workers/t2/send?by=id');
       assert.deepEqual(calls[0][1],{text:'Keep this answer',expected_status:'waiting'});
       assert.equal(input.value,'Keep this answer');assert.match(elements.get('error').textContent,/Task changed/);
       break;
@@ -859,7 +887,7 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       break;
     }
     case 'c1-detail': {
-      run("data.profiles=[{name:'work',model:'Model'}];state.task='t1';detail={task:{id:'t1',name:'Task',status:'running',profile:'work',branch:'task/t1',brief:'Brief'},timeline:[],total:0,next_offset:null};renderModal(true);");
+      run("data.profiles=[{name:'work',model:'Model'}];state.task='t1';detail={task:{id:'t1',name:'Task',status:'running',profile:'work',branch:'w/nova',brief:'Brief'},timeline:[],total:0,next_offset:null};renderModal(true);");
       let markup=elements.get('modalBox').innerHTML;
       for(const action of ['interrupt','stop','model']) assert.ok(markup.includes(`data-action="${action}"`));
       assert.match(markup,/data-diff="1"/);assert.match(markup,/id="taskInput"/);
@@ -1351,7 +1379,7 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
         summary:{tokens:null,known_tokens:20,unknown_sessions:1},
         days:[{day:'2026-01-01',tokens:20,known_tokens:20,unknown_sessions:0}],
         models:[{model:'<fake-model>',tokens:20,known_tokens:20,unknown_sessions:0}],
-        tasks:[{task_id:'t1',tokens:null,known_tokens:null,unknown_sessions:1}],
+        tasks:[{task_id:'t1',code_name:'Nova <tag>',tokens:null,known_tokens:null,unknown_sessions:1}],
         quota:[{provider:'<fixture>',status:'unconfigured'}]}; renderUsage();`);
       assert.match(elements.get('view-usage').innerHTML,/未知/);
       assert.match(elements.get('view-usage').innerHTML,/未配置/);
@@ -1363,7 +1391,9 @@ run(`data.reminders={items:Array.from({length:30},(_,i)=>({id:'r'+(i+1),name:'Re
       assert.match(elements.get('view-usage').innerHTML,/截断/);
       assert.match(elements.get('view-usage').innerHTML,/按天/);
       assert.match(elements.get('view-usage').innerHTML,/按模型/);
-      assert.match(elements.get('view-usage').innerHTML,/按任务/);
+      assert.match(elements.get('view-usage').innerHTML,/按 Worker/);
+      assert.match(elements.get('view-usage').innerHTML,/Nova &lt;tag&gt;/);
+      assert.doesNotMatch(elements.get('view-usage').innerHTML,/>t\d+</);
       run(`usage.summary={tokens:0,known_tokens:0,unknown_sessions:0}; usage.tasks=[]; usage.models=[]; renderUsage();`);
       assert.match(elements.get('view-usage').innerHTML,/>0</);
       assert.match(elements.get('view-usage').innerHTML,/暂无记录/);

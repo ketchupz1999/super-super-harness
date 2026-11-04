@@ -6,7 +6,8 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from super_super_harness import config
+from tests.support import PAGE
+from super_super_harness.ops import config
 from tests.test_items import WebItemCase
 
 
@@ -47,7 +48,7 @@ class SystemPages(unittest.TestCase):
     def run_render_test(self, name):
         root = Path(__file__).resolve().parent.parent
         result = subprocess.run(['node', str(root / 'tests/web_regressions.js'),
-                                 str(root / 'super_super_harness/web/index.html'), name],
+                                 str(PAGE), name],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

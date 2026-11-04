@@ -2,7 +2,7 @@
 import sqlite3
 
 WORKER_LABELS = {"worker.failed": "! 告警", "worker.question": "? 提问",
-                 "worker.stalled": "! 卡住", "worker.done": "✓ 完成"}
+                 "worker.stalled": "! 卡住", "worker.done": "✓"}
 
 
 def worker_notice(db, kind, turn_id, outbox_id=None):
@@ -18,7 +18,7 @@ def worker_notice(db, kind, turn_id, outbox_id=None):
     try:
         # Written events can move to the next turn. Attribute only read events here,
         # so a live title cannot claim results that disappear from its saved history.
-        events = db.execute("SELECT m.id, m.kind, m.task_id, t.seq, t.id, t.name FROM messages m "
+        events = db.execute("SELECT m.id, m.kind, m.task_id, t.seq, t.code_name, t.name FROM messages m "
                             "LEFT JOIN tasks t ON t.id=m.task_id WHERE m.role='event' AND m.turn_id=? "
                             "AND m.status IN ('confirmed','done') ORDER BY m.id", (turn_id,)).fetchall()
     except sqlite3.Error:
@@ -42,8 +42,8 @@ def worker_notice(db, kind, turn_id, outbox_id=None):
     groups = {}
     for row in tasks[:3]:
         label = "? 提问" if original_kind == "question" else WORKER_LABELS[row[1]]
-        name = "%s %s%s" % (row[4], row[5][:80], "…" if len(row[5]) > 80 else "")
+        name = "%s · %s%s" % (row[4], row[5][:80], "…" if len(row[5]) > 80 else "")
         groups.setdefault(label, []).append(name)
-    title = "；".join(label + " · " + "、".join(names) for label, names in groups.items())
-    suffix = " 等 %d 个任务" % len(tasks) if len(tasks) > 3 else ""
+    title = "；".join(label + " " + "、".join(names) for label, names in groups.items())
+    suffix = " 等 %d 个 Worker" % len(tasks) if len(tasks) > 3 else ""
     return kind, title + suffix

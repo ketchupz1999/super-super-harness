@@ -15,7 +15,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from super_super_harness import config
+from super_super_harness.ops import config
 from super_super_harness.daemon import Service
 from tests.support import Gateway, free_port, write_config
 
@@ -120,9 +120,10 @@ async def seed_v21(service):
     await until(lambda: service.store.task(done['id'])['status'] == 'completed')
     await until(lambda: not service.store.current_turn() and not service.store.one("SELECT 1 FROM messages WHERE status!='done'"))
     turn = service.store.open_turn()
-    build = await service.router_tool('task_start', {'name': 'System pages', 'brief': 'TOOLSLEEP 900', 'item': code})
-    await until(lambda: service.store.task(build['task_id'])['progress'].startswith('Bash'))
-    service.tasks.report_progress(build['task_id'], 'Verifying reminder cards and named Worker links')
+    build = await service.router_tool('worker_hire', {'name': 'System pages', 'brief': 'TOOLSLEEP 900', 'item': code})
+    build_id = service.tasks.resolve(build['worker'])['id']
+    await until(lambda: service.store.task(build_id)['progress'].startswith('Bash'))
+    service.tasks.report_progress(build_id, 'Verifying reminder cards and named Worker links')
     now = datetime.now().astimezone()
     await service.router_tool('reminder_add', {'name': 'Review the release', 'text': 'Check the screenshots and release notes.',
                                              'kind': 'notify', 'at': (now + timedelta(hours=1)).isoformat()})

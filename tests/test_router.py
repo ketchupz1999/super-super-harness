@@ -5,13 +5,13 @@ import subprocess
 import sys
 import unittest
 
-from super_super_harness import procs
-from tests.support import ServiceCase
+from super_super_harness.adapters import procs
+from tests.support import MCP_SERVER, ServiceCase
 
 
 class RouterDocuments(ServiceCase):
     async def test_missing_soul_keeps_original_prompt_and_startup(self):
-        from super_super_harness.router import prompt_text
+        from super_super_harness.router.router import prompt_text
         self.assertFalse((self.cfg.router_dir / 'soul.md').exists())
         self.assertEqual(prompt_text(self.cfg), prompt_text())
         self.say('ECHO no soul needed')
@@ -22,7 +22,7 @@ class RouterDocuments(ServiceCase):
     async def test_soul_is_loaded_on_spawn_not_message_and_on_attach(self):
         from unittest.mock import patch
         from super_super_harness.cli import cmd_attach
-        from super_super_harness.router import prompt_text
+        from super_super_harness.router.router import prompt_text
         file = self.cfg.router_dir / 'soul.md'
         file.write_text('# Soul\nNeutral test style')
         self.assertIn('Neutral test style', prompt_text(self.cfg))
@@ -67,7 +67,7 @@ class RouterDocuments(ServiceCase):
         results = await asyncio.gather(*(self.tool('memory_write', content=str(i), version=first['version']) for i in range(2)), return_exceptions=True)
         self.assertEqual(sum(isinstance(r, dict) for r in results), 1)
         self.assertEqual(sum(isinstance(r, ValueError) and 'conflict' in str(r) for r in results), 1)
-        from super_super_harness.router import prompt_text
+        from super_super_harness.router.router import prompt_text
         prompt = prompt_text()
         self.assertIn('memory_read', prompt)
         self.assertIn('memory_write', prompt)
@@ -79,12 +79,12 @@ class RouterFileSafety(unittest.TestCase):
         from pathlib import Path
         import tempfile
         from unittest.mock import patch
-        from super_super_harness.router_files import RouterFiles
+        from super_super_harness.core.router_files import RouterFiles
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder)
             files = RouterFiles(directory)
             first = files.write('memory', 'original', 'missing')
-            with patch('super_super_harness.private_files.os.replace', side_effect=OSError('fake disk failure')):
+            with patch('super_super_harness.core.private_files.os.replace', side_effect=OSError('fake disk failure')):
                 with self.assertRaises(OSError):
                     files.write('memory', 'new', first['version'])
             self.assertEqual(files.read('memory'), first)
@@ -93,13 +93,13 @@ class RouterFileSafety(unittest.TestCase):
     def test_separate_processes_cannot_both_save_same_version(self):
         from pathlib import Path
         import tempfile
-        from super_super_harness.router_files import RouterFiles
+        from super_super_harness.core.router_files import RouterFiles
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder)
             version = RouterFiles(directory).write('memory', 'initial', 'missing')['version']
             code = '''import sys
 from pathlib import Path
-from super_super_harness.router_files import RouterFiles, DocumentError
+from super_super_harness.core.router_files import RouterFiles, DocumentError
 sys.stdin.readline()
 try:
     RouterFiles(Path(sys.argv[1])).write('memory', sys.argv[3], sys.argv[2])
@@ -128,7 +128,7 @@ except DocumentError as error:
     def test_symlink_directory_fifo_and_invalid_names_are_rejected(self):
         from pathlib import Path
         import tempfile
-        from super_super_harness.router_files import RouterFiles, DocumentError
+        from super_super_harness.core.router_files import RouterFiles, DocumentError
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder)
             real = directory / 'real'
@@ -164,7 +164,7 @@ class Inbox(ServiceCase):
         for failure in (OSError("missing clock"), ValueError("bad clock"), struct.error("truncated TZif"),
                         AssertionError("incomplete TZif footer")):
             with self.subTest(failure=type(failure).__name__):
-                with patch.object(router, "process", Mock()), patch("super_super_harness.router.time_context", side_effect=failure):
+                with patch.object(router, "process", Mock()), patch("super_super_harness.router.router.time_context", side_effect=failure):
                     router.ready = True
                     router.mode = "running"
                     await router.pump()
@@ -194,7 +194,7 @@ class Inbox(ServiceCase):
         self.assertEqual(self.service.router.last_list, first)
         session = self.home / "sessions" / "proj" / (self.service.router.session_id + ".jsonl")
         users = [json.loads(line) for line in session.read_text().splitlines() if '"type": "user"' in line]
-        self.assertEqual(sum("<tasks>" in user["message"]["content"] for user in users), 1)
+        self.assertEqual(sum("<workers>" in user["message"]["content"] for user in users), 1)
 
     async def test_compaction_forces_the_list_again(self):
         await self.service.router._on_event({"type": "system", "subtype": "compact_boundary", "compact_metadata": {"trigger": "auto"}})
@@ -205,25 +205,25 @@ class Effects(ServiceCase):
     async def test_side_effects_run_once_per_turn(self):
         self.say("SLEEP 1 ECHO x")
         await self.until(lambda: self.store.current_turn(), label="turn")
-        first = await self.tool("task_start", name="修 bug", brief="ECHO fixed")
-        again = await self.tool("task_start", name="修 bug", brief="ECHO fixed")
-        other = await self.tool("task_start", name="另一个", brief="ECHO other")
-        self.assertEqual(first["task_id"], again["task_id"])
-        self.assertNotEqual(first["task_id"], other["task_id"])
+        first = await self.tool("worker_hire", name="修 bug", brief="ECHO fixed")
+        again = await self.tool("worker_hire", name="修 bug", brief="ECHO fixed")
+        other = await self.tool("worker_hire", name="另一个", brief="ECHO other")
+        self.assertEqual(first["worker"], again["worker"])
+        self.assertNotEqual(first["worker"], other["worker"])
         self.assertEqual(self.store.one("SELECT COUNT(*) c FROM tasks")["c"], 2)
 
     async def test_router_cannot_use_worker_tools(self):
         with self.assertRaises(ValueError):
             await self.tool("report_done", text="x")
         with self.assertRaises(ValueError):
-            await self.service.call_tool(("worker", "t1"), "task_start", {"name": "x", "brief": "y"})
+            await self.service.call_tool(("worker", "t1"), "worker_hire", {"name": "x", "brief": "y"})
 
 
 class QuestionEffects(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         from pathlib import Path
         import tempfile
-        from super_super_harness import config
+        from super_super_harness.ops import config
         from super_super_harness.daemon import Service
         from tests.support import write_config
         self.folder = tempfile.TemporaryDirectory(prefix='ssharness-question-')
@@ -369,12 +369,12 @@ class Recovery(ServiceCase):
         await self.until(lambda: self.store.current_turn(), label="turn")
         session = self.home / "sessions" / "proj" / (self.service.router.session_id + ".jsonl")
         await self.until(lambda: session.exists() and '"type": "user"' in session.read_text(), label="in session")
-        await self.tool("task_start", name="修 bug", brief="ECHO fixed")
+        await self.tool("worker_hire", name="修 bug", brief="ECHO fixed")
         procs.kill_tree(self.service.router.process.pid)
         await self.until(lambda: self.store.one("SELECT 1 FROM messages WHERE role='system'"), timeout=10, label="note")
         note = self.store.one("SELECT text FROM messages WHERE role='system'")["text"]
-        self.assertIn("task_start", note)
-        self.assertIn("t1", note)
+        self.assertIn("worker_hire", note)
+        self.assertIn("Nova", note)
 
     async def test_busy_router_is_interrupted_for_the_user(self):
         self.say("TOOLSLEEP 30")
@@ -565,7 +565,7 @@ class AttachWakeup(ServiceCase):
 class ReplySelection(unittest.TestCase):
     def setUp(self):
         from types import SimpleNamespace
-        from super_super_harness.store import Store
+        from super_super_harness.core.store import Store
         self.store = Store(":memory:")
         self.addCleanup(self.store.close)
         self.box = SimpleNamespace(rows=self.store.all, wait=lambda predicate, *args: predicate())
@@ -608,13 +608,13 @@ class Mcp(ServiceCase):
         token = self.service.issue_token(("worker", "t1"))
         self.store.add_task("x", "y", "work", None, "s", "", "")
         env = dict(os.environ, SSHARNESS_SOCK=str(self.cfg.sock), SSHARNESS_TOKEN=token)
-        script = str(self.cfg.home.parent) and __import__("super_super_harness").__path__[0] + "/mcp_server.py"
+        script = str(MCP_SERVER)
         proc = await asyncio.create_subprocess_exec(sys.executable, "-I", script, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         lines = [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "report_progress", "arguments": {"text": "halfway"}}},
-            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "task_start", "arguments": {"name": "x", "brief": "y"}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "worker_hire", "arguments": {"name": "x", "brief": "y"}}},
         ]
         for line in lines:
             proc.stdin.write((json.dumps(line) + "\n").encode())
@@ -623,7 +623,7 @@ class Mcp(ServiceCase):
         proc.stdin.close()
         await proc.wait()
         self.assertEqual({tool["name"] for tool in answers[1]["result"]["tools"]},
-                         {"report_progress", "report_done", "ask_user", "subscribe", "unsubscribe", "hand_back", "item_read", "item_update"})
+                         {"report_progress", "report_done", "ask_user", "subscribe", "unsubscribe", "hand_back", "item_read", "item_update", "notes_read", "notes_write", "request_help"})
         self.assertFalse(answers[2]["result"]["isError"])
         self.assertEqual(self.store.task("t1")["progress"], "halfway")
         self.assertTrue(answers[3]["result"]["isError"])

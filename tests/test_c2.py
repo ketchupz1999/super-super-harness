@@ -6,6 +6,7 @@ import subprocess
 import unittest
 import uuid
 
+from tests.support import PAGE
 from tests.test_items import WebItemCase
 
 
@@ -56,13 +57,13 @@ class ReadContracts(WebItemCase):
         await self.until(lambda: self.store.task(worker)['started_once'])
         await self.wtool(worker, 'ask_user', question='Continue?', options=['Yes <safe>', 'No'])
         downstream = await self.start('ECHO summary', name='Downstream', item=code, wait_for=[worker])
-        path = '/api/tasks/%s?metadata=1' % worker
+        path = '/api/workers/%s?metadata=1' % worker
         self.assertEqual((await self.request(path=path, headers={'Cookie': ''}))[0], 401)
         task = (await self.request(path=path))[2]['task']
         self.assertIsInstance(task['question_id'], int)
         self.assertEqual(task['options'], ['Yes <safe>', 'No'])
-        self.assertEqual(task['upstream'], [{'id': upstream, 'name': 'Upstream <one>', 'worker_name': 'Nova', 'status': 'completed', 'satisfied': True}])
-        self.assertEqual(task['downstream'], [{'id': downstream, 'name': 'Downstream', 'worker_name': 'Echo', 'status': 'waiting_deps', 'satisfied': False}])
+        self.assertEqual(task['upstream'], [{'id': upstream, 'name': 'Upstream <one>', 'worker_name': 'Nova', 'code_name': 'Nova', 'role': '', 'status': 'completed', 'satisfied': True}])
+        self.assertEqual(task['downstream'], [{'id': downstream, 'name': 'Downstream', 'worker_name': 'Echo', 'code_name': 'Echo', 'role': '', 'status': 'waiting_deps', 'satisfied': False}])
         first_question = task['question_id']
         await self.wtool(worker, 'ask_user', question='Continue again?', options=['Another'])
         task = (await self.request(path=path))[2]['task']
@@ -109,7 +110,7 @@ class RunView(unittest.TestCase):
     def run_render_test(self, name):
         root = Path(__file__).resolve().parent.parent
         result = subprocess.run(['node', str(root/'tests/web_regressions.js'),
-                                 str(root/'super_super_harness/web/index.html'), name],
+                                 str(PAGE), name],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

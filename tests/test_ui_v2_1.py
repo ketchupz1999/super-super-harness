@@ -4,25 +4,23 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
-import re
 import unittest
 from unittest.mock import patch
 
-from super_super_harness.worker_names import WORKER_NAMES, worker_name
-from tests.support import ServiceCase, free_port
+from super_super_harness.workers.worker_names import WORKER_NAMES, unused_name
+from tests.support import PAGE, ServiceCase, free_port
 from tests import test_web
 
 
 class WorkerNames(unittest.TestCase):
-    def test_backend_matches_frozen_v2_algorithm(self):
-        legacy = ('Nova Pixel Echo Atlas Juno Orbit Sage Milo Iris Bolt Luna Rex '
-                  'Kiko Zed Ivy Taro Mochi Finn Nori Pip Remy Skye Toto Wren').split()
-        self.assertEqual(list(WORKER_NAMES), legacy)
-        for seq in range(1, 2401):
-            self.assertEqual(worker_name(seq), legacy[(seq - 1) % 24])
-        page = (Path(__file__).resolve().parents[1] / 'super_super_harness/web/index.html').read_text()
-        fallback = re.search(r'const WORKER_NAMES = (\[.*?\]);', page)[1]
-        self.assertEqual(json.loads(fallback.replace("'", '"')), legacy)
+    def test_pool_is_larger_and_never_cycles(self):
+        self.assertGreater(len(WORKER_NAMES), 24)
+        used = set()
+        for expected in [*WORKER_NAMES, *(name + '2' for name in WORKER_NAMES)]:
+            name = unused_name(used)
+            self.assertEqual(name, expected)
+            used.add(name.lower())
+        self.assertNotIn('const WORKER_NAMES', PAGE.read_text())
 
 
 class ConversationV21(ServiceCase):
@@ -47,21 +45,23 @@ class ConversationV21(ServiceCase):
         state = (await self.request())[2]
         self.assertEqual({t['id']: t['worker_name'] for t in state['tasks']}, dict(zip(ids, ['Nova', 'Pixel', 'Echo'])))
         for task_id, expected in zip(ids, ['Nova', 'Pixel', 'Echo']):
-            detail = (await self.request(path='/api/tasks/' + task_id + '?metadata=1'))[2]['task']
+            detail = (await self.request(path='/api/workers/' + task_id + '?metadata=1'))[2]['task']
             self.assertEqual(detail['worker_name'], expected)
             self.assertEqual(self.service.tasks.read(task_id)['worker_name'], expected)
         self.assertEqual(self.service.items.read(code)['tasks'][0]['worker_name'], 'Nova')
         self.assertEqual((await self.request(path='/api/items/' + code))[2]['tasks'][0]['worker_name'], 'Nova')
-        with patch('super_super_harness.worker_names.WORKER_NAMES', ('<Name>&\nnext',)):
-            table = self.service.tasks.render()
-        for task_id in ids:
-            self.assertIn(task_id + ' &lt;Name&gt;&amp; next', table)
+        # Even corrupt stored identity is rendered as data, never Router markup.
+        for index, task_id in enumerate(ids):
+            self.store.update_task(task_id, code_name='<Name%d>&\nnext' % index)
+        table = self.service.tasks.render()
+        for index, task_id in enumerate(ids):
+            self.assertIn('&lt;Name%d&gt;&amp; next' % index, table)
         self.assertIn('Task &lt;tag&gt;', table)
         self.assertIn('Item &lt;tag&gt;', table)
         self.assertNotIn('<Name>', table)
         self.assertNotIn('<tag>', table)
-        self.assertEqual(table.count('<tasks>'), 1)
-        self.assertEqual(table.count('</tasks>'), 1)
+        self.assertEqual(table.count('<workers>'), 1)
+        self.assertEqual(table.count('</workers>'), 1)
 
     async def test_reminder_cards_use_successful_effects_once_and_survive_cancellation(self):
         self.store.open_turn()
@@ -102,12 +102,12 @@ class ConversationV21(ServiceCase):
         self.store.open_turn()
         with patch.object(self.service.tasks, 'schedule'):
             code = (await self.tool('item_create', code='demo', name='Item <tag>', kind='delivery', permission='act'))['code']
-            task = await self.tool('task_start', name='Task <tag>', brief='ECHO done', item=code)
-            await self.tool('task_send', task_id=task['task_id'], text='More context')
+            task = await self.tool('worker_hire', name='Task <tag>', brief='ECHO done', item=code)
+            await self.tool('worker_assign', worker=task['worker'], text='More context')
             await self.tool('item_update', item=code, progress='Checked')
         for name, args in [('item_create', dict(code='demo', name='Item <tag>', kind='delivery', permission='act')),
-                           ('task_start', dict(name='Task <tag>', brief='ECHO done', item=code)),
-                           ('task_send', dict(task_id=task['task_id'], text='More context')),
+                           ('worker_hire', dict(name='Task <tag>', brief='ECHO done', item=code)),
+                           ('worker_assign', dict(worker=task['worker'], text='More context')),
                            ('item_update', dict(item=code, progress='Checked'))]:
             await self.log_call(name, args)
         self.service.router.reply('Assigned')
@@ -116,7 +116,7 @@ class ConversationV21(ServiceCase):
                          ['Created item Item <tag>', 'Started Nova', 'Sent a message to Nova', 'Updated item Item <tag>'])
         self.assertEqual(message['workers'][0]['worker_name'], 'Nova')
         self.assertEqual(message['workers'][0]['name'], 'Task <tag>')
-        self.assertEqual(message['workers'][0]['id'], task['task_id'])
+        self.assertEqual(message['workers'][0]['id'], self.worker_id(task))
 
     async def test_notes_only_item_update_has_named_summary(self):
         item = self.service.items.create('notes', 'Item notes', 'delivery', 'act')
@@ -152,9 +152,9 @@ class ConversationV21(ServiceCase):
         self.store.update_task(ids[1], status='stopped')
         with patch.object(self.service.tasks, 'schedule'):
             for task_id in ids:
-                args = dict(task_id=task_id, text='Continue')
-                await self.log_call('task_send', args)
-                await self.tool('task_send', **args)
+                args = dict(worker=task_id, text='Continue')
+                await self.log_call('worker_assign', args)
+                await self.tool('worker_assign', **args)
         good = dict(name='Review', text='x' * 400, kind='notify',
                     at=(datetime.now().astimezone() + timedelta(hours=2)).isoformat())
         await self.log_call('reminder_add', good)
@@ -181,15 +181,16 @@ class ConversationV21(ServiceCase):
         self.assertEqual(row['reminders'][0]['id'], reminder['id'])
 
     async def test_task_start_returns_worker_name(self):
-        result = await self.tool('task_start', name='Test work', brief='ECHO done')
-        self.assertEqual(result['worker_name'], 'Nova')
-        await self.wait_status(result['task_id'], 'completed')
+        result = await self.tool('worker_hire', name='Test work', brief='ECHO done')
+        self.assertEqual(result['worker'], 'Nova')
+        await self.wait_status(self.worker_id(result), 'completed')
 
-    async def test_worker_name_lookup_includes_all_cycles_before_limit(self):
-        ids = [self.store.add_task('Work', 'Brief', 'work', None, 'no-session', '', '') for _ in range(49)]
-        rows = self.service.tasks.search('nova', limit=2)
-        self.assertEqual([r['id'] for r in rows], [ids[48], ids[24]])
-        self.assertEqual([r['worker_name'] for r in rows], ['Nova', 'Nova'])
+    async def test_worker_name_lookup_uses_stored_identity_before_limit(self):
+        ids = [self.store.add_task('Work', 'Brief', 'work', None, 'no-session', '', '', code_name=name)
+               for name in ('Nova', 'Nova2', 'Nova3', 'Another')]
+        rows = self.service.tasks.search('nOvA', limit=2)
+        self.assertEqual([r['id'] for r in rows], [ids[2], ids[1]])
+        self.assertEqual([r['worker_name'] for r in rows], ['Nova3', 'Nova2'])
 
 
 @unittest.skipUnless(shutil.which('node'), 'Node.js is needed for frontend regression tests')
@@ -197,7 +198,7 @@ class V21Frontend(unittest.TestCase):
     def check(self, name):
         root = Path(__file__).resolve().parents[1]
         result = subprocess.run(['node', str(root / 'tests/web_regressions.js'),
-                                 str(root / 'super_super_harness/web/index.html'), name],
+                                 str(PAGE), name],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

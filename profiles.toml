@@ -9,6 +9,9 @@ backup = "default" # Add a second Profile to enable a separate fallback model.
 [harness.claude-code]
 binary = "claude"
 
+[harness.hermes]
+binary = "hermes"
+
 [profiles.default]
 harness = "claude-code"
 provider = "anthropic"

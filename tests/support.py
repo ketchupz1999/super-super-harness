@@ -11,9 +11,12 @@ import threading
 import time
 import unittest
 
-from super_super_harness import config
+from super_super_harness.ops import config
 from super_super_harness.daemon import Service
+from super_super_harness.paths import MCP_SERVER, PACKAGE_DIR
 
+PAGE = PACKAGE_DIR / "channels" / "web" / "index.html"
+SUBER = PAGE.parent / "suber"
 HERE = Path(__file__).resolve().parent
 OWNER = ("owner", None)
 ROUTER = ("router", None)
@@ -187,6 +190,12 @@ class ServiceCase(unittest.IsolatedAsyncioTestCase):
 
     async def tool(self, tool_name, /, **args):
         return await self.service.call_tool(ROUTER, tool_name, args)
+
+    def worker_id(self, result):
+        return self.store.one("SELECT id FROM tasks WHERE code_name=? COLLATE NOCASE", result["worker"])["id"]
+
+    def worker_name(self, task_id):
+        return self.store.task(task_id)["code_name"]
 
     def start_task(self, brief, name="任务", **extra):
         return self.service.tasks.start(name, brief, **extra)["id"]

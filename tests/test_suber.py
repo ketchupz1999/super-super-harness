@@ -5,12 +5,13 @@ import struct
 import subprocess
 import unittest
 
+from tests.support import PAGE, SUBER
 ROOT = Path(__file__).resolve().parent.parent
 
 
 class SuberAssets(unittest.TestCase):
     def test_web_assets_are_small_complete_square_canvases(self):
-        folder = ROOT / "super_super_harness/web/suber"
+        folder = SUBER
         expected = {"mark", "idle", "idle-blink", "typing", "typing-clean",
                     "typing-blink", "waiting", "waiting-blink", "done"}
         self.assertEqual({file.stem for file in folder.iterdir()}, expected)
@@ -31,7 +32,7 @@ class SuberAssets(unittest.TestCase):
 class SuberFrontend(unittest.TestCase):
     def run_render_test(self, name):
         result = subprocess.run(["node", str(ROOT / "tests/web_regressions.js"),
-                                 str(ROOT / "super_super_harness/web/index.html"), name],
+                                 str(PAGE), name],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

@@ -52,7 +52,7 @@ def plan(cfg, db, workers):
         return row['value'] if row else default
     session = get('router_session')
     task_limit = TASK_LIMIT - bool(session)
-    tasks = all_rows('SELECT id,session_id,profile,started_once FROM tasks ORDER BY seq DESC LIMIT ?', task_limit + 1)
+    tasks = all_rows('SELECT id,code_name,session_id,profile,started_once FROM tasks ORDER BY seq DESC LIMIT ?', task_limit + 1)
     truncated = len(tasks) > task_limit
     tasks = tasks[:task_limit]
     ids = [row['id'] for row in tasks]
@@ -72,7 +72,8 @@ def plan(cfg, db, workers):
     if session:
         profile = cfg.profiles.get(get('router_profile', cfg.primary))
         sources.append(('router', get('router_harness', profile.harness if profile else ''), session, None, None))
-    return {'tasks': ids, 'sources': sources, 'truncated': truncated,
+    return {'tasks': ids, 'code_names': {row['id']: row['code_name'] for row in tasks},
+            'sources': sources, 'truncated': truncated,
             'workers': dict(workers, queued=db.execute("SELECT COUNT(*) FROM tasks WHERE status='queued'").fetchone()[0]),
             'providers': sorted(cfg.providers)[:PROVIDER_LIMIT],
             'providers_truncated': len(cfg.providers) > PROVIDER_LIMIT}
@@ -344,6 +345,8 @@ def report(cfg, snapshot, start, end, quota_readers=None):
         item['tokens'] = item['known_tokens'] if not item['unknown_sessions'] else None
     if truncated:
         summary['tokens'] = None
+    for tid, item in tasks.items():
+        item['code_name'] = 'Router' if tid == 'router' else snapshot['code_names'].get(tid)
     return {'start': start.isoformat(), 'end': end.isoformat(), 'timezone': 'UTC',
             'workers': snapshot['workers'], 'summary': summary, 'days': list(days.values()),
             'models': model_rows, 'tasks': list(tasks.values()), 'truncated': truncated,

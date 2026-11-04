@@ -9,9 +9,9 @@ import tomllib
 import warnings
 
 from . import config
-from .adapters import get_harness
-from .catalog import AUTH_ENVS, PLANNED, PRESETS, declared_providers
-from .private_files import atomic_write, private_lock, read_private
+from ..adapters import get_harness
+from .catalog import AUTH_ENVS, PLANNED, declared_providers
+from ..core.private_files import atomic_write, private_lock, read_private
 
 
 NAME = re.compile(r"[A-Za-z0-9_-]+\Z")
@@ -183,6 +183,10 @@ def doctor(cfg, names=None, timeout=5):
             checks["harness"] = bool(harness.available(cfg, profile))
             if not checks["harness"]:
                 reasons["harness"] = "the Harness binary was not found"
+            elif hasattr(harness, "installation_check"):
+                checks["harness_setup"], reason = harness.installation_check(cfg, profile, timeout)
+                if not checks["harness_setup"]:
+                    reasons["harness_setup"] = reason
             try:
                 provider.key()
                 checks["credential"] = True

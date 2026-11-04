@@ -1,10 +1,11 @@
 """SQLite store. The database is the source of truth; notifications are only reminders."""
 from contextlib import contextmanager
 import json
+import logging
 import sqlite3
 import time
 
-from .worker_names import named_task
+from ..workers.worker_names import check_code_name, named_task, unused_name
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -57,10 +58,12 @@ CREATE INDEX IF NOT EXISTS outbox_status ON outbox(status);
 CREATE TABLE IF NOT EXISTS tasks (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   id TEXT UNIQUE,
+  code_name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  role TEXT NOT NULL DEFAULT '',
   name TEXT NOT NULL,
   repo TEXT,
   profile TEXT NOT NULL,
-  status TEXT NOT NULL,          -- queued | running | waiting | interrupted | completed | failed | stopped
+  status TEXT NOT NULL,          -- queued | running | waiting | waiting_deps | interrupted | completed | dormant | failed | stopped
   workspace TEXT,
   cwd TEXT,
   branch TEXT,
@@ -75,8 +78,25 @@ CREATE TABLE IF NOT EXISTS tasks (
   origin_channel TEXT NOT NULL DEFAULT '',
   created REAL NOT NULL,
   updated REAL NOT NULL,
+  last_active REAL NOT NULL,
   ended REAL
 );
+
+CREATE TABLE IF NOT EXISTS assignments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  text TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',  -- queued | doing | done | failed
+  result TEXT NOT NULL DEFAULT '',
+  created REAL NOT NULL,
+  started REAL,
+  ended REAL
+);
+CREATE INDEX IF NOT EXISTS assignments_task ON assignments(task_id, status, id);
+
+-- Reservations survive renames and deleted Workers. Code names are never recycled.
+CREATE TABLE IF NOT EXISTS worker_names (code_name TEXT PRIMARY KEY COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS worker_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,7 +174,7 @@ CREATE TABLE IF NOT EXISTS triggers (
   created REAL NOT NULL,
   UNIQUE(source, event_id)
 );
--- Items and what hangs off them. New tables only, so an older release still opens this database.
+-- Items and what hangs off them.
 CREATE TABLE IF NOT EXISTS items (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   code TEXT UNIQUE NOT NULL,
@@ -192,8 +212,15 @@ CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 class Store:
     def __init__(self, path):
+        self.observers = []
+        self._notifications = []
+        self._atomic_depth = 0
         self.db = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        columns = {row["name"] for row in self.all("PRAGMA table_info(tasks)")}
+        if columns and "code_name" not in columns:
+            self.db.close()
+            raise ValueError("This database predates Worker identities; use a new SSHARNESS_HOME. Old databases are not supported.")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
@@ -227,13 +254,32 @@ class Store:
     def atomic(self):
         # Savepoints also work when a caller groups several store operations.
         self.run("SAVEPOINT web_write")
+        mark = len(self._notifications)
+        self._atomic_depth += 1
         try:
             yield
             self.run("RELEASE SAVEPOINT web_write")
         except BaseException:
+            del self._notifications[mark:]
             self.run("ROLLBACK TO SAVEPOINT web_write")
             self.run("RELEASE SAVEPOINT web_write")
             raise
+        finally:
+            self._atomic_depth -= 1
+        if not self._atomic_depth:
+            pending, self._notifications = self._notifications, []
+            for change in pending:
+                self.notify(change)
+
+    def notify(self, change):
+        if self._atomic_depth:
+            self._notifications.append(change)
+            return
+        for observer in tuple(self.observers):
+            try:
+                observer(change)
+            except Exception:
+                logging.getLogger(__name__).exception("store observer failed")
 
     def close(self):
         self.db.close()
@@ -263,6 +309,7 @@ class Store:
         turn = self.current_turn() if source == "router" else None
         cursor = self.run("INSERT INTO events(task_id, source, type, subject, severity, data, created, turn_id) VALUES(?,?,?,?,?,?,?,?)",
                           task_id, source, type, subject, severity, json.dumps(data, ensure_ascii=False), time.time(), turn["id"] if turn else None)
+        self.notify({"type": type, "source": source, "task_id": task_id, "data": data})
         return cursor.lastrowid
 
     # tasks
@@ -272,6 +319,8 @@ class Store:
 
     def update_task(self, task_id, **fields):
         fields["updated"] = time.time()
+        if fields.get("status") != "dormant":
+            fields.setdefault("last_active", fields["updated"])
         if "status" in fields:
             task = self.task(task_id)
             if task and task["status"] != fields["status"]:
@@ -282,13 +331,30 @@ class Store:
                     fields["started"] = fields["updated"]
         names = ", ".join("%s=?" % name for name in fields)
         self.run("UPDATE tasks SET %s WHERE id=?" % names, *fields.values(), task_id)
+        if "status" in fields and task and task["status"] != fields["status"]:
+            self.notify({"type": "worker.status", "task": dict(self.task(task_id))})
 
-    def add_task(self, name, brief, profile, repo, session_id, reason, origin_channel):
+    def reserve_code_name(self, code_name=None):
+        if code_name is None:
+            used = {row["code_name"].lower() for row in self.all("SELECT code_name FROM worker_names")}
+            code_name = unused_name(used)
+        check_code_name(code_name)
+        try:
+            self.run("INSERT INTO worker_names(code_name) VALUES(?)", code_name)
+        except sqlite3.IntegrityError:
+            raise ValueError("code_name %s has already been used" % code_name) from None
+        return code_name
+
+    def add_task(self, name, brief, profile, repo, session_id, reason, origin_channel, code_name=None, role=""):
+        if not isinstance(role, str):
+            raise ValueError("role must be a string")
         now = time.time()
-        cursor = self.run("INSERT INTO tasks(name, brief, profile, repo, status, session_id, reason, origin_channel, created, updated)"
-                          " VALUES(?,?,?,?,?,?,?,?,?,?)", name, brief, profile, repo, "queued", session_id, reason, origin_channel, now, now)
-        task_id = "t%d" % cursor.lastrowid
-        self.run("UPDATE tasks SET id=?, state_since=? WHERE seq=?", task_id, now, cursor.lastrowid)
+        with self.atomic():
+            code_name = self.reserve_code_name(code_name)
+            cursor = self.run("INSERT INTO tasks(name, brief, profile, repo, status, session_id, reason, origin_channel, created, updated, last_active, code_name, role)"
+                              " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", name, brief, profile, repo, "queued", session_id, reason, origin_channel, now, now, now, code_name, role)
+            task_id = "t%d" % cursor.lastrowid
+            self.run("UPDATE tasks SET id=?, state_since=? WHERE seq=?", task_id, now, cursor.lastrowid)
         return task_id
 
     # messages

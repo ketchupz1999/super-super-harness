@@ -1,6 +1,7 @@
 """super-super-harness: talk to the service, or read what happened. Reading works with the service down."""
 import argparse
 import json
+import math
 import os
 import socket
 import sqlite3
@@ -9,11 +10,13 @@ import sys
 import threading
 import time
 
-from . import config, daemon, releases, setup
-from .config import REPO_ROOT
+from .ops import config
+from . import daemon
+from .ops import releases, setup
+from .ops.config import REPO_ROOT
 from .adapters import get_harness, session_harness
-from .router import prompt_text
-from .tasks import LABELS, clip, write_mcp_config
+from .router.router import prompt_text
+from .workers.tasks import LABELS, clip
 
 
 class Client:
@@ -40,29 +43,123 @@ class Client:
         return self.call("emit", event=event)
 
 
+def cmd_watch(cfg, args):
+    from .channels.chat import clean
+    from .channels.watch import BUSY
+
+    deadline = time.monotonic() + args.timeout if args.timeout is not None else None
+    states = {}
+
+    def output(record):
+        if args.json:
+            print(json.dumps(record, ensure_ascii=False), flush=True)
+            return
+        if record.get("event") == "snapshot":
+            for worker in record["workers"]:
+                output(dict(worker, type="snapshot"))
+            if record["router"]:
+                output(record["router"])
+            if not record["workers"] and not record["router"]:
+                print("watch: no matching active Workers", flush=True)
+            return
+        who = record.get("worker", "Router")
+        detail = record.get("question") or record.get("report") or record.get("text", "")
+        if record.get("options"):
+            detail += " [" + " / ".join(record["options"]) + "]"
+        line = "%s %s %s %s" % (who, record["type"], LABELS.get(record.get("status"), ""), detail)
+        print(" ".join(clean(line).split()), flush=True)
+
+    def remaining(setup=False):
+        if deadline is None:
+            return 5 if setup else None
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError
+        return min(left, 5) if setup else left
+
+    try:
+        token = cfg.owner_token_file.read_text().strip()
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.settimeout(remaining(setup=True))
+            sock.connect(str(cfg.sock))
+            sock.sendall((json.dumps({"method": "watch", "token": token, "params": {
+                "workers": args.workers, "item": args.item, "router": args.router}}, ensure_ascii=False) + "\n").encode())
+            with sock.makefile("r", encoding="utf-8") as reader:
+                initial = True
+                while True:
+                    sock.settimeout(remaining(setup=initial))
+                    line = reader.readline()
+                    if not line:
+                        raise ConnectionError("watch connection closed before the condition was met")
+                    packet = json.loads(line)
+                    if "error" in packet:
+                        raise ValueError(packet["error"])
+                    if initial:
+                        snapshot = packet["result"]
+                        if snapshot["event"] != "snapshot":
+                            raise ValueError("invalid watch snapshot")
+                        states = {worker["task_id"]: worker["status"] for worker in snapshot["workers"]}
+                        output(snapshot)
+                        question = snapshot["router"] is not None or "waiting" in states.values()
+                        changed = False
+                        initial = False
+                    else:
+                        if packet["event"] != "watch" or not packet["changes"]:
+                            raise ValueError("invalid watch event")
+                        question = False
+                        for record in packet["changes"]:
+                            output(record)
+                            if record["type"] == "worker.status":
+                                states[record["task_id"]] = record["status"]
+                            question |= record["type"] in ("ask_user", "router.ask_user")
+                        question |= "waiting" in states.values()
+                        changed = True
+                    if question:
+                        return 2
+                    if args.until == "change" and changed:
+                        return 0
+                    if not states and not args.router:
+                        return 0
+                    if args.until == "done" and states and not any(state in BUSY for state in states.values()):
+                        return 0
+    except TimeoutError:
+        if deadline is not None and time.monotonic() >= deadline:
+            print("watch: timed out", file=sys.stderr)
+            return 124
+        print("watch: service connection timed out", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print("watch: %s" % exc, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
 def read_db(cfg):
     return sqlite3.connect("file:%s?mode=ro" % cfg.db, uri=True, timeout=5)
 
 
 def find_task(db, needle):
     db.row_factory = sqlite3.Row
-    row = db.execute("SELECT * FROM tasks WHERE id=?", (needle,)).fetchone()
+    row = db.execute("SELECT * FROM tasks WHERE code_name=? COLLATE NOCASE", (needle,)).fetchone()
+    if row is None:
+        row = db.execute("SELECT * FROM tasks WHERE id=?", (needle,)).fetchone()
     rows = [row] if row else db.execute("SELECT * FROM tasks WHERE name LIKE ? ORDER BY seq DESC", ("%" + needle + "%",)).fetchall()
     if not rows:
-        raise SystemExit("no task matches %r" % needle)
+        raise SystemExit("no Worker matches %r" % needle)
     if len(rows) > 1:
-        names = "；".join("%s %s" % (r["id"], r["name"]) for r in rows[:6])
+        names = "；".join("%s %s" % (r["code_name"], r["name"]) for r in rows[:6])
         raise SystemExit("more than one match: %s" % names)
     return rows[0]
 
 
 def cmd_chat(cfg, args):
-    from .chat import cmd_chat as chat
+    from .channels.chat import cmd_chat as chat
     return chat(cfg, args)
 
 
 def cmd_history(cfg, args):
-    from .chat import CommandHistory, clean
+    from .channels.chat import CommandHistory, clean
     history = None
     try:
         history = CommandHistory(cfg.db)
@@ -135,11 +232,11 @@ def cmd_status(cfg, args):
     db = read_db(cfg)
     db.row_factory = sqlite3.Row
     for row in db.execute("SELECT * FROM tasks ORDER BY seq DESC LIMIT 20"):
-        print("%-5s %-6s %-7s %s  %s" % (row["id"], LABELS[row["status"]], row["profile"], row["name"], clip(row["progress"], 60)))
+        print("%-5s %-6s %-7s %s  %s" % (row["code_name"], LABELS[row["status"]], row["profile"], row["name"], clip(row["progress"], 60)))
 
 
 def cmd_reminders(cfg, args):
-    from .reminders import local_stamp
+    from .events.reminders import local_stamp
     if not cfg.db.exists():
         print("No reminders.")
         return
@@ -246,7 +343,7 @@ def cmd_log(cfg, args):
             text = item["text"] if args.raw else clip(item["text"], 300)
             print("%s %-22s %s" % (item["time"][11:19], name.strip(), text))
         return
-    print("%s %s（%s，%s）" % (task["id"], task["name"], LABELS[task["status"]], task["profile"]))
+    print("%s %s（%s，%s）" % (task["code_name"], task["name"], LABELS[task["status"]], task["profile"]))
     print("目录：%s  分支：%s" % (task["cwd"], task["branch"]))
     print("为什么选这个模型：%s\n" % (task["reason"] or "默认"))
     last = show_events(db, task["id"], 0)
@@ -329,10 +426,10 @@ def cmd_open(cfg, args):
     task = client.call("task_hold", task_id=task["id"])
     profile = cfg.profile(task["profile"])
     try:
-        return exec_interactive(cfg, task["profile"], task["session_id"], task["cwd"], None, None)
+        return exec_interactive(cfg, task["profile"], task["session_id"], task["cwd"], None, task.get("system_prompt"))
     finally:
         client.call("task_release", task_id=task["id"])
-        print("%s 已交还，状态：%s。要继续就告诉 Router。" % (task["id"], task["status"]))
+        print("%s 已交还，状态：%s。要继续就告诉 Router。" % (task["code_name"], task["status"]))
 
 
 def cmd_wait(cfg, args):
@@ -420,8 +517,8 @@ def main():
     emit.add_argument("--json", help="read the whole event from a JSON file, or - for stdin")
     events = commands.add_parser("events", help="list recent events and where they went, even with the service stopped")
     events.add_argument("--limit", type=int, default=20, help="number of events (default: 20)")
-    log = commands.add_parser("log", help="what a task did")
-    log.add_argument("task")
+    log = commands.add_parser("log", help="what a Worker did")
+    log.add_argument("task", metavar="WORKER", help="code name (case-insensitive), internal id, or part of its name")
     log.add_argument("--full", action="store_true", help="everything the Harness recorded")
     log.add_argument("--kinds", help="received,said,thinking,tool_call,tool_result")
     log.add_argument("--raw", action="store_true", help="do not shorten")
@@ -429,8 +526,15 @@ def main():
     commands.add_parser("peek", help="open a copy of the Router session")
     commands.add_parser("attach", help="take the Router over in the terminal")
     open_task = commands.add_parser("open", help="take a Worker over in the terminal")
-    open_task.add_argument("task")
+    open_task.add_argument("task", metavar="WORKER", help="code name (case-insensitive), internal id, or part of its name")
     commands.add_parser("wait", help="block until the Router has a message")
+    watch = commands.add_parser("watch", help="wait for Worker changes (owner-only server push)")
+    watch.add_argument("workers", nargs="*", metavar="WORKER", help="code name or internal id; default: currently active Workers")
+    watch.add_argument("--item", metavar="CODE", help="filter Workers by item")
+    watch.add_argument("--until", choices=("done", "change"), default="done")
+    watch.add_argument("--timeout", type=float, metavar="SECONDS")
+    watch.add_argument("--json", action="store_true", help="one JSON object per line")
+    watch.add_argument("--router", action="store_true", help="also watch Router questions")
     commands.add_parser("stop-check", help="Stop hook used by attach")
     upgrade = commands.add_parser("upgrade", help="install a commit, test it, switch to it, roll back if it is unhealthy")
     upgrade.add_argument("--repo")
@@ -471,6 +575,10 @@ def main():
         return 0 if all(r["ok"] for r in results) else 1
     if args.command == "serve":
         return daemon.serve()
+    if args.command == "watch":
+        if args.timeout is not None and (not math.isfinite(args.timeout) or not 0 < args.timeout <= 31536000):
+            parser.error("--timeout must be greater than zero and at most 31536000 seconds (365 days)")
+        return cmd_watch(config.Paths(config.home_path()), args)
     if args.command == "history":
         if not 0 < args.limit <= 2 ** 63 - 1:
             parser.error("--limit must be between 1 and 9223372036854775807")

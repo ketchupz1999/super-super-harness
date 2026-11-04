@@ -8,7 +8,7 @@ import subprocess
 import unittest
 
 from tests import test_web
-from tests.support import ServiceCase, free_port
+from tests.support import PAGE, ServiceCase, free_port
 from tests.test_avatar import tiny_png
 
 
@@ -48,6 +48,8 @@ class PrivateCharacters(ServiceCase):
         image = tiny_png()
         (root / 'claude-v1.png').write_bytes(image)
         (root / 'harness-claude-code.png').write_bytes(image)
+        # service_pid is written after the Router and service startup writes finish.
+        await self.until(lambda: self.store.get('service_pid') == str(os.getpid()), label='service startup completed')
         before = self.store.db.total_changes
         state = (await self.request())[2]
         art = state['characters'][0]
@@ -125,7 +127,7 @@ class PrivateCharacters(ServiceCase):
         run = self.store.one('SELECT started, ended FROM worker_runs WHERE task_id=? ORDER BY id DESC LIMIT 1', task)
         self.assertEqual(summary['activity']['run_started'], run['started'])
         self.assertEqual(summary['activity']['run_ended'], run['ended'])
-        path = '/api/tasks/' + task + '?metadata=1'
+        path = '/api/workers/' + task + '?metadata=1'
         self.assertEqual((await self.request(path=path, headers={'Cookie': ''}))[0], 401)
         detail = (await self.request(path=path))[2]['task']
         self.assertEqual(detail['session_id'], self.store.task(task)['session_id'])
@@ -148,7 +150,7 @@ class PrivateCharacters(ServiceCase):
         task = self.store.add_task('History', 'work', 'work', None, 'no-session', '', '')
         for i in range(251):
             self.store.event('worker', 'report.progress', task, text='Entry %d' % i)
-        path = '/api/tasks/' + task
+        path = '/api/workers/' + task
         page = (await self.request(path=path + '?tail=1&limit=100'))[2]
         self.assertEqual(page['offset'], 151)
         self.assertEqual(page['previous_offset'], 51)
@@ -168,7 +170,7 @@ class V2Frontend(unittest.TestCase):
     def check(self, name):
         root = Path(__file__).resolve().parent.parent
         result = subprocess.run(['node', str(root / 'tests/web_regressions.js'),
-                                 str(root / 'super_super_harness/web/index.html'), name],
+                                 str(PAGE), name],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

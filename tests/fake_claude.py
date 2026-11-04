@@ -3,12 +3,17 @@
 
   SLEEP n     stay inside the turn for n seconds, as a foreground tool would
   TOOLSLEEP n same, but emits a Bash tool_use first
+  BACKGROUND n  start a background task; after n seconds notify and run another turn
+  BACKGROUND_BATCH n count  start count tasks together, then consume their notifications in one turn
+  BACKGROUND_INLINE  start and finish a task, consuming its notification attachment in this turn
   FAIL        finish the turn with is_error=true
   CRASH       exit without a result
   ALWAYSFAIL, ALWAYSCRASH  same, and for every later turn of this session too
   HANG        accept the message and never answer
   SILENTHANG  same, with no replay: the message is in the session but nobody was told
   RETRY n     emit n api_retry events, then finish
+  COMPACT n   emit compact_boundary with pre_tokens=n, then continue
+  TOOLONG     finish the turn with a context overflow error
   ECHO text   reply with text
   DONE word     call report_done(word) through the router MCP server, as Claude Code does
   SUBDONE word  same, from inside a sub-agent: the tool_use carries parent_tool_use_id
@@ -93,14 +98,32 @@ def call_router(word, text):
 
 queue = []
 interrupted = False
+backgrounds = {}
 
 
 buffered = b""
 
 
+def background_changed():
+    emit(type="system", subtype="background_tasks_changed", tasks=[{"id": key} for key in backgrounds])
+
+
 def pump(timeout):
-    """Read stdin for up to timeout seconds. Returns False on EOF."""
+    """Read stdin for up to timeout seconds. Returns False on EOF; background completions enqueue their own turn."""
     global interrupted, buffered
+    notifications = {}
+    for key, (deadline, batch) in list(backgrounds.items()):
+        if time.monotonic() >= deadline:
+            del backgrounds[key]
+            notifications.setdefault(batch, []).append(key)
+    if notifications:
+        background_changed()
+        for keys in notifications.values():
+            text = "\n".join("<task-notification>\n<task-id>%s</task-id>\n<status>completed</status>\n</task-notification>" % key
+                             for key in keys)
+            # Like a Harness-internal input, this has no host-supplied UUID. Its
+            # queueing and its consumption are separate, even during SLEEP.
+            queue.append({"message": {"role": "user", "content": text + " ECHO background finished"}})
     if b"\n" not in buffered:
         ready, _, _ = select.select([0], [], [], timeout)
         if not ready:
@@ -141,7 +164,10 @@ def run(msg):
         while pump(1):
             pass
         sys.exit(0)
-    emit(type="user", uuid=msg.get("uuid"), isReplay=True, message=msg["message"])
+    if msg.get("uuid"):
+        emit(type="user", uuid=msg["uuid"], isReplay=True, message=msg["message"])
+    else:
+        emit(type="user", message=msg["message"])
     words = text.split()
     for word in ("ALWAYSFAIL", "ALWAYSCRASH"):
         if word in words:
@@ -161,8 +187,30 @@ def run(msg):
                 return
             if word == "TOOLSLEEP":
                 emit(type="user", message={"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "ok"}]})
+        elif word in ("BACKGROUND", "BACKGROUND_BATCH"):
+            batch = "background-%d" % time.monotonic_ns()
+            count = int(words[index + 2]) if word == "BACKGROUND_BATCH" else 1
+            deadline = time.monotonic() + float(words[index + 1])
+            for number in range(count):
+                backgrounds["%s-%d" % (batch, number)] = (deadline, batch)
+            background_changed()
+        elif word == "BACKGROUND_INLINE":
+            key = "inline-%d" % time.monotonic_ns()
+            backgrounds[key] = (float("inf"), key)
+            background_changed()
+            del backgrounds[key]
+            background_changed()
+            # Attachments are persisted but need not be exposed on stream-json.
+            # Unlike BACKGROUND, no second input/result will arrive.
+            record("attachment", attachment={"type": "queued_command", "commandMode": "task-notification", "prompt":
+                   "<task-notification>\n<task-id>%s</task-id>\n<status>completed</status>\n</task-notification>" % key})
         elif word in ("DONE", "SUBDONE", "GHOSTDONE", "OLDDONE", "OLDSUBDONE"):
             call_router(word, words[index + 1])
+        elif word == "COMPACT":
+            emit(type="system", subtype="compact_boundary", compact_metadata={"trigger": "auto", "pre_tokens": int(words[index + 1])})
+        elif word == "TOOLONG":
+            result("Prompt is too long · automatic compaction failed: context exhausted", True)
+            return
         elif word == "FAIL":
             result("API Error: 503", True)
             return

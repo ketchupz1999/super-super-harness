@@ -55,6 +55,9 @@ def get_harness(cfg, profile) -> Harness:
     if name == "claude-code" and name not in _registry:
         from . import claude_code
         register(name, claude_code)
+    if name == "hermes" and name not in _registry:
+        from . import hermes
+        register(name, hermes)
     if name not in _registry:
         raise ValueError("unknown Harness %r; register an implementation first" % name)
     return _registry[name]

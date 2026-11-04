@@ -50,7 +50,7 @@ def run_tests(target):
                                    "tests.test_harness", "tests.test_chat", "tests.test_reminders", "tests.test_avatar",
                                    "tests.test_bus", "tests.test_items", "tests.test_suber", "tests.test_c1", "tests.test_c2",
                                    "tests.test_c5", "tests.test_ui_v2",
-                                   "tests.test_ui_v2_1", "tests.test_routing_graph"], cwd=str(target), env=env,
+                                   "tests.test_ui_v2_1", "tests.test_routing_graph", "tests.test_worker_identity"], cwd=str(target), env=env,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
         except subprocess.TimeoutExpired:
             return False

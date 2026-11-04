@@ -7,8 +7,8 @@ import tomllib
 from urllib.parse import urlsplit
 
 from .catalog import AUTH_ENVS, declared_providers
+from ..paths import REPO_ROOT
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 SEVERITIES = ("info", "warn", "critical")
 PERMISSIONS = ("observe", "notify", "act")
 ACTIONS = ("drop", "record", "direct", "wake")
@@ -218,8 +218,15 @@ def from_raw(raw, home):
             raise ValueError("default and Router Profiles must exist")
     if profiles[raw["router"]["primary"]].harness != profiles[raw["router"]["backup"]].harness:
         raise ValueError("Router primary and backup must use the same Harness")
-    limits = {"max_workers": 10, "busy_interrupt_seconds": 10, "stall_minutes": 30, "worker_retries": 3}
+    limits = {"max_workers": 10, "busy_interrupt_seconds": 10, "stall_minutes": 30, "worker_retries": 3, "dormant_days": 7,
+              "compact_thrash": 3, "background_grace_seconds": 20}
     limits.update(raw.get("limits", {}))
+    if type(limits["dormant_days"]) is not int or limits["dormant_days"] < 1:
+        raise ValueError("limits.dormant_days must be a positive integer")
+    if type(limits["compact_thrash"]) is not int or limits["compact_thrash"] < 1:
+        raise ValueError("limits.compact_thrash must be a positive integer")
+    if type(limits["background_grace_seconds"]) is not int or limits["background_grace_seconds"] < 1:
+        raise ValueError("limits.background_grace_seconds must be a positive integer")
     failover = {"silent_seconds": 20, "deep_probe_seconds": 120, "retries": 5, "probe_timeout": 5,
                 "wake_grace_seconds": 90, "primary_check_seconds": 300}
     failover.update(raw.get("failover", {}))

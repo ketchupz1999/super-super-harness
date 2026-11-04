@@ -10,17 +10,20 @@ import sys
 import time
 import uuid
 
-from . import config, procs, tools
+from .ops import config
+from .adapters import procs
+from .router import tools
 from .adapters import session_harness
-from .bus import LIMITS, Bus
-from .items import Items, brief_header
-from .outbox import Outbox
-from .private_files import persistent_secret
-from .reminders import Reminders
-from .router import ProviderPreparationError, Router
-from .store import Store
-from .tasks import Tasks, clip
-from .web import Web
+from .events.bus import LIMITS, Bus
+from .core.items import Items, brief_header
+from .channels.outbox import Outbox
+from .channels.watch import Watch
+from .core.private_files import persistent_secret
+from .events.reminders import Reminders
+from .router.router import ProviderPreparationError, Router
+from .core.store import Store
+from .workers.tasks import Tasks, clip
+from .channels.web import Web
 
 HEARTBEAT_SECONDS = 30
 TASK_NAME = 200  # well under the bus data limit, so a long name cannot roll back a Worker result
@@ -39,6 +42,7 @@ class Service:
         self.outbox = Outbox(self.store)
         self.items = Items(cfg, self.store)
         self.tasks = Tasks(cfg, self.store, self.on_task_change, self.issue_token, self.items)
+        self.watch = Watch(self.store, self.tasks, self.items)
         self.router = Router(cfg, self.store, self.tasks, self.outbox, self.issue_token)
         self.bus = Bus(self.store, self.router, self.outbox, cfg.sources, cfg.rules, self.tasks)
         self.reminders = Reminders(self.store, self.router, self.outbox, bus=self.bus)
@@ -65,10 +69,12 @@ class Service:
                 self.store.event("system", "avatar.done" if kind == "worker.done" else "avatar.error")
             if kind == "worker.done":
                 self.items.record_done(task_id, text)
+            if kind == "worker.handoff":
+                self.store.event("system", kind, task_id, text=text)
             # Built-in rule worker.* wakes the Router with the same summary as before.
             self.bus.emit({"source": "worker", "type": kind, "id": uuid.uuid4().hex, "thread": "task:" + task_id,
-                           "severity": "warn" if kind in ("worker.failed", "worker.stalled", "worker.blocked") else "info",
-                           "text": text[:LIMITS["text"]], "data": {"task_id": task_id, "name": task["name"][:TASK_NAME]}})
+                           "severity": "warn" if kind in ("worker.failed", "worker.stalled", "worker.blocked", "worker.handoff", "worker.completion_stuck") else "info",
+                           "text": text[:LIMITS["text"]], "data": {"task_id": task_id, "worker": task["code_name"], "name": task["name"][:TASK_NAME]}})
 
     # tools
     def tool_specs(self, identity):
@@ -84,7 +90,7 @@ class Service:
             return self.worker_tool(task_id, name, args)
         key = tools.chat_call_key(name, args)
         try:
-            result = await self.router_tool(name, args)
+            result = await self.router_tool(name, args, tool_use_id)
         except (ValueError, KeyError):
             if key:
                 self.store.event("router", "tool.completed", call_key=key, ok=False)
@@ -102,17 +108,89 @@ class Service:
             return self.bus.subscribe(task_id, args["thread"], on=name == "subscribe")
         if name == "hand_back":
             return self.bus.hand_back(task_id, args["event_id"], args["reason"])
+        if name == "request_help":
+            if set(args) - {"text", "to"}:
+                raise ValueError("invalid request_help arguments")
+            self.tasks._refuse_stopped(task_id)
+            target = self.tasks.resolve(args["to"])["code_name"] if args.get("to") is not None else None
+            return self.bus.request_help(task_id, args["text"], target)
+        if name in ("notes_read", "notes_write"):
+            required = set() if name == "notes_read" else {"content", "version"}
+            if set(args) != required:
+                raise ValueError("invalid notes tool arguments")
+            if name == "notes_read":
+                return self.tasks.notes_read(task_id)
+            return self.tasks.notes_write(task_id, args["content"], args["version"])
         # A Worker reads and updates only its own item, and only next and notes.
         code = self.items.of(task_id)
         if not code:
-            raise ValueError("this task is not attached to an item")
+            raise ValueError("this Worker is not attached to an item")
         if name == "item_read":
-            return self.items.read(code)
+            return self._item_view(self.items.read(code))
         if set(args) - {"next", "notes", "notes_version"}:
             raise ValueError("a Worker may update only next and notes")
-        return self.items.update(code, next=args.get("next"), notes=args.get("notes"), notes_version=args.get("notes_version"))
+        return self._item_view(self.items.update(code, next=args.get("next"), notes=args.get("notes"), notes_version=args.get("notes_version")))
 
-    async def router_tool(self, name, args):
+    def _worker_view(self, value):
+        """Project a known internal Worker record, never arbitrary event payloads."""
+        result = dict(value)
+        if "code_name" in result:
+            result["worker"] = result["code_name"]
+            for key in ("seq", "id", "code_name", "worker_name"):
+                result.pop(key, None)
+        if "task_id" in result:
+            task = self.store.task(result.pop("task_id"))
+            result["worker"] = task["code_name"] if task else ""
+        if "waiting_for" in result:
+            result["waiting_for"] = [self.store.task(ref)["code_name"] for ref in result["waiting_for"]]
+        if "wait_for" in result:
+            result["wait_for"] = [{"worker": self.store.task(row["upstream"])["code_name"], "satisfied": row["satisfied"]}
+                                  for row in result["wait_for"]]
+        return result
+
+    def _item_view(self, value):
+        result = dict(value)
+        if "tasks" in result:
+            result["workers"] = [self._worker_view(worker) for worker in result.pop("tasks")]
+        return result
+
+    async def router_tool(self, name, args, tool_use_id=None):
+        given, args = args, dict(args)
+        bound = False
+        try:
+            if "worker" in args and (name.startswith("worker_") or name == "item_attach"):
+                args["worker"] = self.tasks.resolve(args["worker"])["id"]
+                self.router.bind_worker_tool(name, given, args["worker"], tool_use_id)
+                bound = True
+            if name in ("worker_hire", "worker_wait_for") and "wait_for" in args:
+                refs = args["wait_for"]
+                if not isinstance(refs, list) or len(refs) > 20:
+                    raise ValueError("wait_for must be a list of at most 20 Workers")
+                args["wait_for"] = [self.tasks.resolve(ref)["id"] for ref in refs]
+            result = await self._router_tool(name, args)
+            if name == "worker_hire":
+                self.router.bind_worker_tool(name, given, result["task_id"], tool_use_id)
+                bound = True
+        finally:
+            if not bound:
+                self.router.bind_worker_tool(name, given, None, tool_use_id)
+        if name == "worker_search":
+            return [self._worker_view(worker) for worker in result]
+        if name.startswith("worker_") and name != "worker_detail" or name == "item_attach":
+            result = self._worker_view(result)
+            if "worker" in args:
+                result["worker"] = self.store.task(args["worker"])["code_name"]
+        elif name in ("item_create", "item_read", "item_update", "item_close"):
+            result = self._item_view(result)
+        elif name == "event_read" and "task_id" in result:
+            # Only the log envelope is ours. The event's data belongs to its source.
+            result = dict(result)
+            task_id = result.pop("task_id")
+            task = self.store.task(task_id) if task_id else None
+            result["worker"] = task["code_name"] if task else ""
+        return result
+
+    async def _router_tool(self, name, args):
         tasks, router = self.tasks, self.router
         if name in ('memory_read', 'memory_write'):
             required = set() if name == 'memory_read' else {'content', 'version'}
@@ -143,13 +221,13 @@ class Service:
                 return router.once(name, identity, lambda: router.ask_user(args["question"], args.get("options")))
         if name == "reply":
             return router.once("reply", "reply" + args["text"], lambda: router.reply(args["text"]))
-        if name == "task_start":
+        if name == "worker_hire":
             def start():
                 task = tasks.start(args["name"], args["brief"], args.get("profile"), args.get("repo"), args.get("reason", ""), self._origin(),
-                                   args.get("item"), args.get("wait_for"))
-                result = {"task_id": task["id"], "worker_name": task["worker_name"], "status": task["status"], "profile": task["profile"]}
-                if args.get("item"):
-                    result["item"] = args["item"]
+                                   args.get("item"), args.get("wait_for"), args.get("code_name"), args.get("role", ""))
+                # Effects keep a stable id; the model sees the current code name even after a rename.
+                result = {"task_id": task["id"], "status": task["status"], "profile": task["profile"],
+                          "item": self.items.of(task["id"])}
                 if task["status"] == "waiting_deps":
                     waiting = self.store.all("SELECT d.upstream FROM task_deps d JOIN tasks t ON t.id=d.upstream "
                                              "WHERE d.task_id=? AND d.satisfied IS NULL ORDER BY t.seq", task["id"])
@@ -157,9 +235,9 @@ class Service:
                     if not waiting:
                         result["note"] = "every upstream has completed; it starts in a moment"
                 return result
-            return router.once("task_start", "start" + args["brief"], start)
-        if name == "task_wait_for":
-            return tasks.wait_for(args["task_id"], args["wait_for"])
+            return router.once(name, name + args["brief"], start)
+        if name == "worker_wait_for":
+            return tasks.wait_for(args["worker"], args["wait_for"])
         if name == "item_create":
             return router.once(name, name + json.dumps(args, sort_keys=True, ensure_ascii=False),
                                lambda: self.items.create(args["code"], args["name"], args["kind"], args["permission"],
@@ -174,29 +252,32 @@ class Service:
         if name == "item_close":
             return self.items.close(args["item"], args.get("reason", ""))
         if name == "item_attach":
-            result = self.items.attach_existing(args["item"], args["task_id"], args.get("move", False))
+            result = self.items.attach_existing(args["item"], args["worker"], args.get("move", False))
             if result["ok"] and "note" not in result:
                 moved = " It was moved from item %s, which is no longer yours." % result["moved_from"] if "moved_from" in result else ""
-                self.tasks.tell(args["task_id"], "The Router attached this task to an item.%s\n%s"
+                self.tasks.tell(args["worker"], "The Router attached you to an item.%s\n%s"
                                 % (moved, brief_header(self.items.get(result["item"]))))
             return result
-        if name == "task_send":
-            return router.once("task_send", "send" + args["task_id"] + args["text"],
-                               lambda: tasks.send(args["task_id"], args["text"], args.get("expected_status")))
-        if name == "task_interrupt":
-            return tasks.interrupt(args["task_id"])
-        if name == "task_resume":
-            return tasks.resume(args["task_id"], args.get("text"))
-        if name == "task_stop":
-            return await tasks.stop(args["task_id"])
-        if name == "task_switch_model":
-            return await tasks.switch_model(args["task_id"], args["profile"])
-        if name == "task_read":
-            return tasks.read(args["task_id"])
-        if name == "task_detail":
-            return self.task_detail(args["task_id"], args.get("kinds"), args.get("limit", 40))
-        if name == "task_search":
+        if name in ("worker_assign", "worker_say"):
+            action = tasks.send if name == "worker_assign" else tasks.say
+            return router.once(name, name + args["worker"] + args["text"],
+                               lambda: action(args["worker"], args["text"], args.get("expected_status")))
+        if name == "worker_interrupt":
+            return tasks.interrupt(args["worker"])
+        if name == "worker_resume":
+            return tasks.resume(args["worker"], args.get("text"))
+        if name == "worker_stop":
+            return await tasks.stop(args["worker"])
+        if name == "worker_switch_model":
+            return await tasks.switch_model(args["worker"], args["profile"])
+        if name == "worker_read":
+            return tasks.read(args["worker"])
+        if name == "worker_detail":
+            return self.task_detail(args["worker"], args.get("kinds"), args.get("limit", 40))
+        if name == "worker_search":
             return tasks.search(args["query"])
+        if name == "worker_rename":
+            return tasks.rename(args["worker"], args["code_name"])
         if name == "event_read":
             if "trigger_id" in args:
                 row = self.store.one("SELECT * FROM triggers WHERE id=?", args["trigger_id"])
@@ -251,6 +332,8 @@ class Service:
             if isinstance(event, dict) and event.get("source") in tuple(config.BUILTIN_SOURCES):
                 raise ValueError("source %s is internal" % event["source"])
             return self.bus.emit(event)
+        if method == "watch":
+            return self.watch.subscribe(writer, params.get("workers"), params.get("item"), params.get("router", False))
         if method == "subscribe":
             self.outbox.channels["terminal"].clients.add(writer)
             asyncio.create_task(self.outbox.flush())
@@ -320,6 +403,7 @@ class Service:
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
         finally:
+            self.watch.remove(writer)
             self.outbox.channels["terminal"].clients.discard(writer)
             self.clients.discard(writer)
             writer.close()

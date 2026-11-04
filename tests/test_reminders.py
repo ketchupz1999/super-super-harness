@@ -13,10 +13,11 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from super_super_harness import cli, tools
-from super_super_harness.outbox import Outbox
-from super_super_harness.reminders import Cron, Reminders, local_stamp, parse_at, system_notify
-from super_super_harness.store import Store
+from super_super_harness import cli
+from super_super_harness.router import tools
+from super_super_harness.channels.outbox import Outbox
+from super_super_harness.events.reminders import Cron, Reminders, local_stamp, parse_at, system_notify
+from super_super_harness.core.store import Store
 from tests import test_web
 from tests.support import ServiceCase, free_port
 
@@ -49,14 +50,14 @@ class TimezoneFileTests(unittest.TestCase):
         self.probe('relative')
 
     def test_timezone_parser_assertions_fall_back_to_libc(self):
-        from super_super_harness.reminders import LibcZone, local_zone
+        from super_super_harness.events.reminders import LibcZone, local_zone
         import time
         try:
             for name in (':/unreadable-test-zone', 'Unlisted/Zone'):
                 with self.subTest(name=name), patch.dict(os.environ, TZ=name), \
                         patch('zoneinfo.TZPATH', ()), \
-                        patch('super_super_harness.reminders.open', return_value=io.BytesIO(b'TZif2\n')), \
-                        patch('super_super_harness.reminders.ZoneInfo') as parser:
+                        patch('super_super_harness.events.reminders.open', return_value=io.BytesIO(b'TZif2\n')), \
+                        patch('super_super_harness.events.reminders.ZoneInfo') as parser:
                     parser.side_effect = AssertionError('invalid TZif header')
                     parser.from_file.side_effect = AssertionError('invalid TZif footer')
                     self.assertIsInstance(local_zone(), LibcZone)
@@ -64,10 +65,10 @@ class TimezoneFileTests(unittest.TestCase):
             time.tzset()
 
     def test_relative_name_missing_from_tzpath_keeps_zoneinfo_fallback(self):
-        from super_super_harness.reminders import local_zone
+        from super_super_harness.events.reminders import local_zone
         marker = object()
         with patch.dict(os.environ, TZ='Missing/Zone'), patch('zoneinfo.TZPATH', ()), \
-                patch('super_super_harness.reminders.ZoneInfo', return_value=marker) as parser:
+                patch('super_super_harness.events.reminders.ZoneInfo', return_value=marker) as parser:
             self.assertIs(local_zone(), marker)
             parser.assert_called_once_with('Missing/Zone')
 
@@ -213,15 +214,15 @@ class ReminderTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(local_stamp(following), "2026-11-02T01:30:00-05:00")
 
     async def test_timezone_file_errors_fall_back_to_libc(self):
-        from super_super_harness.reminders import LibcZone, local_zone, time_context
+        from super_super_harness.events.reminders import LibcZone, local_zone, time_context
         import time
         try:
             for failure in (OSError("unreadable zone"), ValueError("invalid TZif")):
                 with self.subTest(failure=type(failure).__name__), patch.dict(os.environ, TZ=":/bad-zone"), \
-                        patch("super_super_harness.reminders.open", side_effect=failure):
+                        patch("super_super_harness.events.reminders.open", side_effect=failure):
                     self.assertIsInstance(local_zone(), LibcZone)
                     self.assertIn("now", time_context(self.now))
-            with patch.dict(os.environ, {}, clear=True), patch("super_super_harness.reminders.open", side_effect=FileNotFoundError):
+            with patch.dict(os.environ, {}, clear=True), patch("super_super_harness.events.reminders.open", side_effect=FileNotFoundError):
                 self.assertIsInstance(local_zone(), LibcZone)
         finally:
             time.tzset()
@@ -235,9 +236,9 @@ class ReminderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"cut": 5}', result.stdout)
 
     async def test_timezone_name_from_localtime_link(self):
-        from super_super_harness.reminders import time_context
+        from super_super_harness.events.reminders import time_context
         with patch.dict(os.environ, {}, clear=True), \
-                patch("super_super_harness.reminders.os.path.realpath", return_value="/var/db/timezone/zoneinfo/Asia/Shanghai"):
+                patch("super_super_harness.events.reminders.os.path.realpath", return_value="/var/db/timezone/zoneinfo/Asia/Shanghai"):
             self.assertEqual(time_context(self.now)["timezone"], "Asia/Shanghai")
 
     async def test_cron_dst_first_fold_and_gap_boundary(self):
@@ -363,7 +364,7 @@ class ReminderTests(unittest.IsolatedAsyncioTestCase):
         self.add("run")
         self.store.run("UPDATE reminders SET cron='bad' WHERE id=1")
         self.now += 61
-        with self.assertLogs("super_super_harness.reminders", level="WARNING"):
+        with self.assertLogs("super_super_harness.events.reminders", level="WARNING"):
             await self.reminders.tick()
         self.assertEqual(self.count("messages"), 1)
 
@@ -374,22 +375,22 @@ class ReminderTests(unittest.IsolatedAsyncioTestCase):
             cli.cmd_reminders(SimpleNamespace(db=self.path), None)
         self.assertIn("Review notes", output.getvalue())
         self.assertIn("notify", output.getvalue())
-        from super_super_harness.chat import STYLES
+        from super_super_harness.channels.chat import STYLES
         self.assertNotEqual(STYLES["reminder"], STYLES["answer"])
 
     def test_system_notification_uses_only_argv_and_failure_is_safe(self):
         title, body = '" & do shell script "bad"', 'line 1\nline 2'
-        with patch("super_super_harness.reminders.sys.platform", "darwin"), patch("super_super_harness.reminders.subprocess.run") as run:
+        with patch("super_super_harness.events.reminders.sys.platform", "darwin"), patch("super_super_harness.events.reminders.subprocess.run") as run:
             system_notify(title, body)
             argv = run.call_args.args[0]
             self.assertNotIn(title, argv[2])
             self.assertEqual(argv[-3:], ["--", title, body])
             run.side_effect = subprocess.CalledProcessError(1, "osascript")
-            with self.assertLogs("super_super_harness.reminders", level="WARNING") as logs:
+            with self.assertLogs("super_super_harness.events.reminders", level="WARNING") as logs:
                 system_notify(title, body)
             self.assertNotIn(title, str(logs.output))
-        with patch("super_super_harness.reminders.sys.platform", "linux"), patch("super_super_harness.reminders.subprocess.run") as run:
-            with self.assertLogs("super_super_harness.reminders", level="INFO"):
+        with patch("super_super_harness.events.reminders.sys.platform", "linux"), patch("super_super_harness.events.reminders.subprocess.run") as run:
+            with self.assertLogs("super_super_harness.events.reminders", level="INFO"):
                 system_notify(title, body)
             run.assert_not_called()
 
@@ -454,7 +455,7 @@ class ReminderWebTests(ServiceCase):
         self.assertEqual(await self.tool("reminder_add", **args), replacement)  # Finished is still replayable.
 
     async def test_state_survives_unreadable_localtime(self):
-        with patch.dict(os.environ, {}, clear=True), patch("super_super_harness.reminders.open", side_effect=FileNotFoundError):
+        with patch.dict(os.environ, {}, clear=True), patch("super_super_harness.events.reminders.open", side_effect=FileNotFoundError):
             status, _, body = await self.request()
         self.assertEqual(status, 200)
         self.assertIn("timezone", body["reminders"])

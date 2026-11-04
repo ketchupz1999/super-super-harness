@@ -588,5 +588,5 @@ def run(cfg, client_factory, input_stream=None, output=None):
 
 
 def cmd_chat(cfg, args):
-    from .cli import Client
+    from ..cli import Client
     return run(cfg, Client)

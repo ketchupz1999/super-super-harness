@@ -4,13 +4,15 @@ import shutil
 import subprocess
 import unittest
 
+from tests.support import PAGE
+
 
 @unittest.skipUnless(shutil.which('node'), 'Node.js is needed for frontend regression tests')
 class RoutingGraph(unittest.TestCase):
     def check(self, scenario):
         root = Path(__file__).resolve().parents[1]
         result = subprocess.run(['node', str(root / 'tests/web_regressions.js'),
-                                 str(root / 'super_super_harness/web/index.html'), scenario],
+                                 str(PAGE), scenario],
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

@@ -29,7 +29,8 @@ REPO = Path("/tmp/ssharness-e2e-repo")
 BARE = Path("/tmp/ssharness-e2e-bare")
 sys.path.insert(0, str(ROOT))
 os.environ["SSHARNESS_HOME"] = str(HOME)
-from super_super_harness import config, procs  # noqa: E402
+from super_super_harness.ops import config
+from super_super_harness.adapters import procs  # noqa: E402
 from super_super_harness.cli import Client  # noqa: E402
 from tests.reply_helpers import MessageStamp, reply_after  # noqa: E402
 
@@ -425,7 +426,7 @@ def attach():
         check("attach 期间 Router 已让出", box.client.call("status")["router"]["mode"] == "attached")
         outside = box.say("终端外发来的消息：暗号后面加个 X")
         target = HOME / "router" / "woke.txt"
-        type_line("用 task_start 开一个任务，名字“接管测试”，用 worker，内容是用 Bash 运行 echo hi-from-worker 并报告输出。"
+        type_line("用 worker_hire 聘请一个 Worker，名字“接管测试”，用 worker，内容是用 Bash 运行 echo hi-from-worker 并报告输出。"
                   "Worker 的结果到了之后，把结论写进当前目录的 woke.txt。")
         end = time.time() + 150
         while time.time() < end and not target.exists():
@@ -468,7 +469,7 @@ def takeover():
         term.line("/exit")
         term.drain(5)
         box.wait(lambda: box.rows("SELECT 1 FROM tasks WHERE id='t1' AND status='interrupted'"), 10, "released")
-        box.client.call("tool_owner", name="task_resume", args={"task_id": "t1", "text": "不用再 sleep 了。说出你写过哪个文件，然后结束。"})
+        box.client.call("tool_owner", name="worker_resume", args={"worker": "t1", "text": "不用再 sleep 了。说出你写过哪个文件，然后结束。"})
         done = box.wait(lambda: box.rows("SELECT 1 FROM tasks WHERE id='t1' AND status='completed'"), 90, "done")
         task = box.tasks()[0]
         check("交还后 Router 能接着用，同一会话", done and task["session_id"] == session and "taken" in task["report"], task["report"][:80])

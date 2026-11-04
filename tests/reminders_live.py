@@ -7,10 +7,10 @@ from pathlib import Path
 import tempfile
 import time
 
-from super_super_harness import config
+from super_super_harness.ops import config
 from super_super_harness.adapters import register
 from super_super_harness.daemon import Service
-from super_super_harness.reminders import local_stamp
+from super_super_harness.events.reminders import local_stamp
 from tests.fake_harness import FakeHarness
 from tests.support import free_port, write_config
 

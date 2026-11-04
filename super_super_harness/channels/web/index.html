@@ -443,6 +443,8 @@
   .robot[data-robot="running"] .robot-hand { animation:robot-type .45s ease-in-out infinite alternate; }
   .robot[data-robot="running"] .robot-hand.right { animation-delay:.22s; }
   .robot[data-robot="pending"] { opacity:.45; }
+  .robot[data-robot="dormant"], .worker-sprite[data-robot="dormant"] { opacity:.5; }
+  .worker-sprite[data-robot="dormant"] > .robot { opacity:1; }
   .robot[data-robot="rest"] .robot-eyes circle { fill:#9aa3ad; }
   .robot-badge circle { stroke:var(--surface); stroke-width:1.2; }
   .robot-badge text { fill:#fff; font:700 7px sans-serif; text-anchor:middle; }
@@ -903,7 +905,7 @@ function markdown(text) {
   };
   return blocks(esc(text).replace(/\r\n?/g,'\n').split('\n'));
 }
-const statuses = ['waiting','running','waiting_deps','queued','interrupted','completed','failed','stopped'];
+const statuses = ['waiting','running','waiting_deps','queued','interrupted','completed','dormant','failed','stopped'];
 const safeStatus = s => statuses.includes(s) ? s : 'queued';
 const dot = s => `<i class="state ${safeStatus(s)}" title="${safeStatus(s)}"></i>`;
 const label = s => `<span class="statusline">${dot(s)}<span class="label ${safeStatus(s)}">${safeStatus(s)}</span></span>`;
@@ -950,12 +952,12 @@ function buildRunGroups() {
     byCode.get(code).tasks.push(task);
   }
   for(const group of groups) {
-    // A bounded state response can omit known members; show their real IDs, not invented metadata.
-    for(const id of group.item?.tasks || []) if(!tasks.has(id)) group.tasks.push({id,name:id,missing:true,wait_for:[]});
+    // Missing metadata keeps the internal key, but never exposes it as a display name.
+    for(const id of group.item?.tasks || []) if(!tasks.has(id)) group.tasks.push({id,missing:true,wait_for:[]});
     const own=new Set(group.tasks.map(t=>t.id)), references=new Map();
     for(const task of group.tasks) for(const dependency of task.wait_for || []) {
       if(!own.has(dependency.task_id)) references.set(dependency.task_id,
-        {...(tasks.get(dependency.task_id) || {id:dependency.task_id,name:dependency.task_id,missing:true}),reference:true,wait_for:[]});
+        {...(tasks.get(dependency.task_id) || {id:dependency.task_id,code_name:dependency.code_name,name:dependency.name,role:dependency.role,missing:true}),reference:true,wait_for:[]});
     }
     group.references=[...references.values()];
   }
@@ -1015,10 +1017,10 @@ function renderItemGraph() {
     lastMap=fingerprint;
     $('itemGraph').innerHTML=groups.map((group,index)=>{
       const plan=layoutRunGroup(group,columns), center=plan.width/2, nodes=new Map(plan.nodes.map(n=>[n.id,n]));
-      const worker=n=>`<g class="comm-node ${n.reference?'reference':''}" data-role="worker" data-task="${esc(n.id)}" data-reference="${n.reference}" transform="translate(${n.x} ${n.y})" tabindex="0" role="button"><title>${esc(n.id+' '+(n.task.name || n.id))}</title><rect class="comm-disc" width="208" height="88" rx="9"/><circle class="comm-halo" cx="185" cy="20" r="8"/><circle class="comm-mark" cx="185" cy="20" r="4"/><text class="comm-code" x="14" y="22">${esc(n.id)}</text><text class="comm-name" x="14" y="44">${esc(graphText(n.task.name || n.id))}</text><text class="comm-status" x="14" y="66">${n.reference?'External upstream · ':''}${n.task.missing?'Not loaded':esc(statusNames[safeStatus(n.task.status)])}</text><text class="comm-duration" x="194" y="79" text-anchor="end" ${n.task.missing?'':`data-timer="${esc(n.id)}"`}>${n.task.missing?'':esc(elapsed(n.task))}</text></g>`;
+      const worker=n=>`<g class="comm-node ${n.reference?'reference':''}" data-role="worker" data-task="${esc(n.id)}" data-reference="${n.reference}" transform="translate(${n.x} ${n.y})" tabindex="0" role="button"><title>${esc(workerName(n.task)+' '+(n.task.name || ''))}</title><rect class="comm-disc" width="208" height="88" rx="9"/><circle class="comm-halo" cx="185" cy="20" r="8"/><circle class="comm-mark" cx="185" cy="20" r="4"/><text class="comm-code" x="14" y="22">${esc(workerName(n.task))}</text><text class="comm-name" x="14" y="44">${esc(graphText(n.task.name || workerName(n.task)))}</text><text class="comm-status" x="14" y="66">${n.reference?'External upstream · ':''}${n.task.missing?'Not loaded':esc(statusNames[safeStatus(n.task.status)])}</text><text class="comm-duration" x="194" y="79" text-anchor="end" ${n.task.missing?'':`data-timer="${esc(n.id)}"`}>${n.task.missing?'':esc(elapsed(n.task))}</text></g>`;
       const dependencies=plan.edges.map(edge=>{
         const from=nodes.get(edge.from),to=nodes.get(edge.to); if(!from || !to) return '';
-        return `<path class="dependency-edge" data-dependency="${esc(edge.from+':'+edge.to)}" data-satisfied="${edge.satisfied}" marker-end="url(#dependency-arrow-${index})" d="${dependencyPath(from,to)}"><title>${esc(edge.from+' → '+edge.to)} · ${edge.satisfied?'dependency met':'waiting for upstream'}</title></path>`;
+        return `<path class="dependency-edge" data-dependency="${esc(edge.from+':'+edge.to)}" data-satisfied="${edge.satisfied}" marker-end="url(#dependency-arrow-${index})" d="${dependencyPath(from,to)}"><title>${esc(workerName(from.task)+' → '+workerName(to.task))} · ${edge.satisfied?'dependency met':'waiting for upstream'}</title></path>`;
       }).join('');
       const communication=plan.nodes.filter(n=>!n.reference && !n.task.missing).map(n=>{
         const root=!(n.task.wait_for || []).length;
@@ -1033,6 +1035,7 @@ function renderItemGraph() {
   }
   const current=$('avatarState').textContent || 'idle', tasks=new Map(data.tasks.map(t=>[t.id,t]));
   if(state.task && detail?.task?.id===state.task && !tasks.has(detail.task.id)) tasks.set(detail.task.id,detail.task);
+  for(const group of groups) for(const task of [...group.tasks,...group.references]) if(!tasks.has(task.id) || (!tasks.get(task.id).code_name && task.code_name)) tasks.set(task.id,task);
   const byGroup=new Map(groups.map(g=>[g.code || '',g]));
   $('itemGraph').querySelectorAll('.item-group').forEach(node=>{
     const group=byGroup.get(node.dataset.item); if(!group) return;
@@ -1045,11 +1048,12 @@ function renderItemGraph() {
     const status=router?current:task?safeStatus(task.status):n.dataset.role==='user'?'user':'unloaded';
     n.dataset.status=status;
     if(router || n.dataset.task) {
-      const name=router?(data.router.avatar?.name || 'Router'):task?.name || n.dataset.task;
-      const label=router?current:task?(statusNames[status] || status):'Not loaded';
+      const name=router?(data.router.avatar?.name || 'Router'):task?.name || workerName(task);
+      const label=router?current:task && !task.missing?(statusNames[status] || status):'Not loaded';
+      if(n.dataset.task) n.querySelector('.comm-code').textContent=workerName(task);
       n.querySelector('.comm-name').textContent=graphText(name);
       n.querySelector('.comm-status').textContent=(n.dataset.reference==='true'?'External upstream · ':'')+label;
-      const title=(n.dataset.task?n.dataset.task+' ':'')+name+' · '+label+(task? ' · '+humanProgress(task):'');
+      const title=(n.dataset.task?workerName(task)+' ':'')+name+' · '+label+(task? ' · '+humanProgress(task):'');
       n.querySelector('title').textContent=title; n.setAttribute('aria-label',title);
     }
     n.classList.toggle('selected',Boolean(n.dataset.task) && n.dataset.task===state.selectedTask);
@@ -1061,7 +1065,7 @@ function renderItemGraph() {
   $('itemGraph').querySelectorAll('[data-dependency]').forEach(path=>{
     if(!path.dataset.dependency) return;
     const satisfied=Boolean(dependencies.get(path.dataset.dependency)); path.dataset.satisfied=String(satisfied);
-    path.querySelector('title').textContent=path.dataset.dependency.replace(':',' → ')+' · '+(satisfied?'dependency met':'waiting for upstream');
+    path.querySelector('title').textContent=path.dataset.dependency.split(':').map(id=>workerName(tasks.get(id))).join(' → ')+' · '+(satisfied?'dependency met':'waiting for upstream');
   });
 }
 const routingStatuses = ['waiting','running','waiting_deps','queued'];
@@ -1115,17 +1119,12 @@ const itemTag = code => code ? `<span class="item-tag ${itemTone(code)}" title="
 const LANE=112, LANE_GAP=8;
 let lastRouting='', lastLanes='', lastEnded='';
 const laneMarkup = t => workerCard(t,'lane');
-// The backend owns identity. This frozen v2 fallback only serves older snapshots without worker_name.
-const WORKER_NAMES = ['Nova','Pixel','Echo','Atlas','Juno','Orbit','Sage','Milo','Iris','Bolt','Luna','Rex','Kiko','Zed','Ivy','Taro','Mochi','Finn','Nori','Pip','Remy','Skye','Toto','Wren'];
-const workerNumber = id => { const match=String(id || '').match(/^t(\d+)$/); return match ? Number(match[1]) : 0; };
+// Identity comes from the stored Worker, never from its sequence number.
 function workerName(value) {
-  const id=typeof value==='object'?value?.id:value;
-  const task=typeof value==='object'?value:find(id);
-  if(task?.worker_name) return task.worker_name;
-  const n=workerNumber(id);
-  return n ? WORKER_NAMES[(n-1)%WORKER_NAMES.length] : String(id || 'Worker');
+  const task=typeof value==='object'?value:find(value);
+  return task?.code_name || 'Unknown Worker';
 }
-const workerSub = t => `${esc(t.name || t.id)} · ${esc(t.id)}`;
+const workerSub = t => [t.name || workerName(t),t.role].filter(Boolean).map(esc).join(' · ');
 function workerCharacter(t) {
   const model=String(t.model || '').toLowerCase(), harness=String(t.harness || '').toLowerCase();
   if(harness==='codex') return 'codex';
@@ -1209,6 +1208,7 @@ function robotState(t) {
   if(t.status==='running') return 'running';
   if(t.status==='waiting') return 'waiting';
   if(['queued','waiting_deps'].includes(t.status)) return 'pending';
+  if(t.status==='dormant') return 'dormant';
   if(t.status==='failed') return 'failed';
   if(t.status==='completed' && t.ended && now()-t.ended<8) return 'done';
   return 'rest';
@@ -1520,15 +1520,21 @@ function reconcileDispatch(rows, baseline, enabled) {
   const attempts=[];
   for(const step of [...steps.values()].sort((a,b)=>a.id-b.id)) {
     let body;try { body=JSON.parse(step.text); } catch { body=null; }
-    if(step.name==='task_send' || step.name==='mcp__router__task_send') {
-      try { const input=JSON.parse(body?.input); if(/^t\d+$/.test(input.task_id) && typeof input.text==='string') attempts.push({id:input.task_id,text:input.text,turn:step.turn}); } catch {}
+    if(['worker_assign','worker_say','task_send'].includes(step.name.replace(/^mcp__router__/,''))) {
+      try {
+        const input=JSON.parse(body?.input), worker=input.worker ?? input.task_id;
+        const peers=rows.flatMap(row=>row.workers || []).concat(data.tasks);
+        const saved=step.task_id ?? body?.task_id;
+        const target=typeof saved==='string' ? {id:saved} : typeof worker==='string' ? peers.find(t=>t.code_name?.toLowerCase()===worker.toLowerCase()) || peers.find(t=>t.id===worker) : null;
+        if(target && typeof input.text==='string') attempts.push({id:target.id,text:input.text,turn:step.turn});
+      } catch {}
     }
     if(step.name==='task.message' && typeof body?.text==='string') {
       // Never use a turn-wide list as a per-step destination unless it has one
       // member. Multi-task turns additionally need a unique matching tool call.
       const candidates=attempts.filter(a=>a.turn===step.turn && a.text===body.text && step.targets.has(a.id));
       const target=step.targets.size===1?[...step.targets][0]:candidates.length===1?candidates[0].id:null;
-      if(!baseline && enabled && step.id>traffic.toolLatest && target && /^t\d+$/.test(target)) flow(target,false,'dispatch');
+      if(!baseline && enabled && step.id>traffic.toolLatest && target) flow(target,false,'dispatch');
       if(candidates.length===1) attempts.splice(attempts.indexOf(candidates[0]),1);
     }
   }
@@ -1824,7 +1830,7 @@ async function chooseOption(target, questionId, index) {
   navigationEpoch++; optionBusy=true; renderActivity(); renderThread();
   try {
     // Read-only preflight reduces stale UI races; the existing write API has no atomic question-ID guard.
-    const fresh=target==='router'?(await api('state')).router.question:(await api(`tasks/${encodeURIComponent(target)}?metadata=1`)).task;
+    const fresh=target==='router'?(await api('state')).router.question:(await api(`workers/${encodeURIComponent(target)}?by=id&metadata=1`)).task;
     const freshId=target==='router'?fresh?.id:fresh?.status==='waiting'?fresh.question_id:null;
     if(String(freshId)!==String(questionId) || fresh?.options?.[index]!==text) { error('This question changed. Check the current question and try again.'); return; }
     if(target==='router') {
@@ -1835,7 +1841,7 @@ async function chooseOption(target, questionId, index) {
 }
 function renderThread(force=false) {
   const rows = [...messages.values()].sort((a,b) => a.id-b.id);
-  const fingerprint = JSON.stringify([rows,[...pending],data.router.busy,[...state.open],state.historical,hasOlder,data.user,data.tasks.map(t=>[t.id,t.name,t.worker_name,t.status,t.model,t.harness]),data.router.question,optionBusy,actionBusy,[...answeredChoices]]);
+  const fingerprint = JSON.stringify([rows,[...pending],data.router.busy,[...state.open],state.historical,hasOlder,data.user,data.tasks.map(t=>[t.id,t.name,t.code_name,t.role,t.status,t.model,t.harness]),data.router.question,optionBusy,actionBusy,[...answeredChoices]]);
   if (!force && fingerprint === lastThread) return;
   lastThread = fingerprint;
   const nearBottom=followingConversation();
@@ -1887,8 +1893,8 @@ function renderReminders() {
     $('reminders').innerHTML=`<h2 class="section">Reminders <span>${reminders.length}</span></h2><div class="card">`+(rows.join('') || '<div class="empty">No reminders. Ask Router to add one.</div>')+'</div>';
   });
 }
-const statusNames={waiting:'Needs you',running:'Running',waiting_deps:'Waiting on deps',queued:'Queued',interrupted:'Interrupted',completed:'Done',failed:'Failed',stopped:'Stopped'};
-const workerFilters={active:['running','queued','waiting_deps','interrupted'],waiting:['waiting'],ended:['completed','failed','stopped']};
+const statusNames={waiting:'Needs you',running:'Running',waiting_deps:'Waiting on deps',queued:'Queued',interrupted:'Interrupted',completed:'Done',dormant:'Dormant',failed:'Failed',stopped:'Stopped'};
+const workerFilters={active:['running','queued','waiting_deps','interrupted'],waiting:['waiting'],ended:['completed','dormant','failed','stopped']};
 const filterNames={active:'Running',waiting:'Needs you',ended:'Done'};
 function filteredTasks() {
   const query=state.query.trim().toLocaleLowerCase(), allowed=workerFilters[state.tableFilter] || workerFilters.active;
@@ -1963,7 +1969,7 @@ function renderUsage() {
   if (!usage) { $('view-usage').innerHTML='<div class="empty">Loading usage…</div>'; return; }
   const u=usage;
   const table=(title,key,rows)=>`<h2 class="section">${title}</h2><div class="card" style="overflow-x:auto"><table><thead><tr><th scope="col">${title}</th><th scope="col">Token</th><th scope="col">已知小计</th><th scope="col">未知会话</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r[key] ?? '未知模型')}</td><td class="num">${usageNumber(r.tokens)}</td><td class="num">${usageNumber(r.known_tokens)}</td><td class="num">${esc(r.unknown_sessions)}</td></tr>`).join('')}</tbody></table>${rows.length?'':'<div class="empty">暂无记录</div>'}</div>`;
-  $('view-usage').innerHTML=`<div class="page-inner"><h1 class="page-title">Usage · 用量</h1><p class="page-sub">${esc(u.start)} ≤ 日期 &lt; ${esc(u.end)} · ${esc(u.timezone)} · 最近 7 天 · 每 3 秒刷新</p><div class="stats"><div class="card stat"><small>运行中 Workers</small><b>${esc(u.workers.running)}</b></div><div class="card stat"><small>排队 Workers</small><b>${esc(u.workers.queued)}</b></div><div class="card stat"><small>同时运行上限</small><b>${esc(u.workers.limit)}</b></div><div class="card stat"><small>Token · 已报告总量</small><b>${usageNumber(u.summary.tokens)}</b><span>已知小计 ${usageNumber(u.summary.known_tokens)}</span></div></div><p>输入 + 输出 + 缓存读取 + 缓存写入；不是费用或账户账单。缺失用量为「未知」，不计成 0。无记录不代表未消耗。</p>${u.truncated?'<p role="status">数据已截断：达到读取或返回上限，仅展示有界样本，不能作为完整总量。</p>':''}${u.summary.unknown_sessions?'<p>有无法完整定位的未知会话：各天均保留未知标记，不猜测日期或模型。</p>':''}${table('按天','day',u.days)}${table('按模型','model',u.models)}${table('按任务','task_id',u.tasks)}<h2 class="section">Provider 额度 · 可选接入</h2><div class="card"><table><thead><tr><th scope="col">Provider</th><th scope="col">额度</th></tr></thead><tbody>${u.quota.map(q=>`<tr><td>${esc(q.provider)}</td><td>${q.status==='unconfigured'?'未配置':q.status==='available'?`剩余 ${usageNumber(q.remaining)} / ${usageNumber(q.limit)} tokens`:'未知'}</td></tr>`).join('')}</tbody></table>${u.quota.length?'':'<div class="empty">未配置</div>'}</div></div>`;
+  $('view-usage').innerHTML=`<div class="page-inner"><h1 class="page-title">Usage · 用量</h1><p class="page-sub">${esc(u.start)} ≤ 日期 &lt; ${esc(u.end)} · ${esc(u.timezone)} · 最近 7 天 · 每 3 秒刷新</p><div class="stats"><div class="card stat"><small>运行中 Workers</small><b>${esc(u.workers.running)}</b></div><div class="card stat"><small>排队 Workers</small><b>${esc(u.workers.queued)}</b></div><div class="card stat"><small>同时运行上限</small><b>${esc(u.workers.limit)}</b></div><div class="card stat"><small>Token · 已报告总量</small><b>${usageNumber(u.summary.tokens)}</b><span>已知小计 ${usageNumber(u.summary.known_tokens)}</span></div></div><p>输入 + 输出 + 缓存读取 + 缓存写入；不是费用或账户账单。缺失用量为「未知」，不计成 0。无记录不代表未消耗。</p>${u.truncated?'<p role="status">数据已截断：达到读取或返回上限，仅展示有界样本，不能作为完整总量。</p>':''}${u.summary.unknown_sessions?'<p>有无法完整定位的未知会话：各天均保留未知标记，不猜测日期或模型。</p>':''}${table('按天','day',u.days)}${table('按模型','model',u.models)}${table('按 Worker','code_name',u.tasks)}<h2 class="section">Provider 额度 · 可选接入</h2><div class="card"><table><thead><tr><th scope="col">Provider</th><th scope="col">额度</th></tr></thead><tbody>${u.quota.map(q=>`<tr><td>${esc(q.provider)}</td><td>${q.status==='unconfigured'?'未配置':q.status==='available'?`剩余 ${usageNumber(q.remaining)} / ${usageNumber(q.limit)} tokens`:'未知'}</td></tr>`).join('')}</tbody></table>${u.quota.length?'':'<div class="empty">未配置</div>'}</div></div>`;
 }
 async function loadUsage() {
   if(usageBusy) return; usageBusy=true;
@@ -1998,7 +2004,7 @@ function reportLead(report) {
   return {lead:blocks[0],more:blocks.length>1};
 }
 function drawerOverview(task) {
-  const relations=(rows,empty,direction)=>rows?.length?`<div class="drawer-relations">${rows.map(row=>`<button class="btn" id="drawer-${direction}-${esc(row.id)}" data-task="${esc(row.id)}">${esc(workerName(row))} · ${esc(row.name || row.id)} <small>${esc(row.id)} · ${row.status?esc(statusNames[safeStatus(row.status)]):'Unknown Worker'} · ${row.satisfied?'met':'pending'}</small></button>`).join('')}</div>`:`<p class="empty">${empty}</p>`;
+  const relations=(rows,empty,direction)=>rows?.length?`<div class="drawer-relations">${rows.map(row=>`<button class="btn" id="drawer-${direction}-${esc(row.id)}" data-task="${esc(row.id)}">${esc(workerName(row))} <small>${workerSub(row)} · ${row.status?esc(statusNames[safeStatus(row.status)]):'Unknown Worker'} · ${row.satisfied?'met':'pending'}</small></button>`).join('')}</div>`:`<p class="empty">${empty}</p>`;
   const doing=humanProgress(task), report=reportLead(task.report);
   return `${doing?`<p class="drawer-now">${esc(doing)}</p>`:''}${task.status==='waiting' && task.question?`<div class="drawer-ask"><b>Needs you</b><p>${esc(task.question)}</p><div class="confirmation-actions">${questionOptions({id:task.question_id,options:task.options},task.id,'drawer-option')}<button class="btn primary" id="drawer-confirm-${esc(task.id)}" data-confirm="${esc(task.id)}">Answer in chat</button></div></div>`:''}${report?`<div class="message-text markdown report-lead">${markdown(report.lead)}</div>${report.more?`<details id="drawerReport" class="drawer-report" ${state.reportOpen?'open':''}><summary id="drawerReportToggle">Full report</summary><div class="message-text markdown">${markdown(task.report)}</div></details>`:''}`:''}<details id="drawerContext" ${state.contextOpen?'open':''}><summary id="drawerContextToggle">Context</summary>${task.branch?`<p class="code">${esc(task.branch)}</p>`:''}<h3>Brief</h3><div class="message-text markdown">${markdown(task.brief || '')}</div><h3>Waits on</h3>${relations(task.upstream,'No upstream Workers.','upstream')}<h3>Unblocks</h3>${relations(task.downstream,'No downstream Workers.','downstream')}<button class="btn" id="drawer-chain-${esc(task.id)}" data-worker-link="${esc(task.id)}">View route</button></details>`;
 }
@@ -2035,8 +2041,8 @@ function transcriptMarkup(s, i) {
 }
 async function copyWorkerSession(command=false) {
   const t=detail?.task;
-  if(!t || t.id!==state.task || (command && !/^t\d+$/.test(t.id))) return;
-  const text=command?'supersuperharness open '+t.id:t.session_id;
+  if(!t || t.id!==state.task || (command && !/^[A-Za-z][A-Za-z0-9-]{0,23}$/.test(t.code_name || ''))) return;
+  const text=command?'supersuperharness open '+t.code_name:t.session_id;
   if(!text) return;
   const notice=command?`Paste in a terminal to resume this Worker's ${harnessName(t)} session. Exit to hand it back.`:'Session ID copied.';
   try { await navigator.clipboard.writeText(text); $('sessionNotice').textContent=notice; }
@@ -2051,7 +2057,7 @@ function renderModal(force=false) {
   const fingerprint=JSON.stringify([detail,actionBusy,optionBusy,[...answeredChoices],state.diff]);
   if(!force && fingerprint===lastModal) return; lastModal=fingerprint;
   const live=t.status==='running', stoppable=['running','queued','waiting','waiting_deps','interrupted'].includes(t.status);
-  const menu=`<details id="drawerMenu" class="more-menu" ${state.menuOpen?'open':''}><summary id="drawerMenuToggle" class="btn">More</summary><div class="menu-panel">${live?'<button class="btn" data-action="interrupt" id="drawerInterrupt">Interrupt</button>':''}${['interrupted','failed'].includes(t.status)?'<button class="btn primary" data-action="resume" id="drawerResume">Resume</button>':''}<div class="menu-model"><select id="profileSelect" aria-label="Switch model" class="btn">${data.profiles.map(p=>`<option value="${esc(p.name)}" ${p.name===t.profile?'selected':''} title="${esc(p.model)}">${esc(shortModel(p.model))}</option>`).join('')}</select><button class="btn" data-action="model" id="drawerModel">Switch model</button></div>${t.branch?'<button class="btn" data-diff="1" id="drawerDiff">View diff</button>':''}${stoppable?'<button class="btn danger" data-action="stop" id="drawerStop">Stop</button>':''}</div></details>`;
+  const menu=`<details id="drawerMenu" class="more-menu" ${state.menuOpen?'open':''}><summary id="drawerMenuToggle" class="btn">More</summary><div class="menu-panel">${live?'<button class="btn" data-action="interrupt" id="drawerInterrupt">Interrupt</button>':''}${['interrupted','failed','dormant'].includes(t.status)?'<button class="btn primary" data-action="resume" id="drawerResume">Resume</button>':''}<div class="menu-model"><select id="profileSelect" aria-label="Switch model" class="btn">${data.profiles.map(p=>`<option value="${esc(p.name)}" ${p.name===t.profile?'selected':''} title="${esc(p.model)}">${esc(shortModel(p.model))}</option>`).join('')}</select><button class="btn" data-action="model" id="drawerModel">Switch model</button></div>${t.branch?'<button class="btn" data-diff="1" id="drawerDiff">View diff</button>':''}${stoppable?'<button class="btn danger" data-action="stop" id="drawerStop">Stop</button>':''}</div></details>`;
   const old=$('sessionConversation'), follow=!state.diff && !state.timelinePinned && (!old || old.scrollHeight-old.scrollTop-old.clientHeight<100);
   preserve($('modalBox'), () => $('modalBox').innerHTML=`<div class="modal-head"><div class="drawer-heading"><div class="drawer-title">${workerAvatar(t,40)}<h2>${esc(workerName(t))}<small class="worker-sub">${workerSub(t)}</small></h2>${menu}<button class="icon-btn" id="drawerClose" data-close="1" title="Close">✕</button></div><div class="modal-sub">${modelTag(t.model)}${harnessTag(t)}<span class="statusline">${dot(t.status)}${statusNames[safeStatus(t.status)]}</span>${itemTag(t.item)}<span>This run · ${timer(t)}</span></div><div class="session-controls"><button class="btn session-id" id="copySession" title="Copy session ID" ${t.session_id?'':'disabled'}>Session: ${esc(t.session_id || 'Not started')}</button><button class="btn" id="resumeTerminal" ${t.session_id?'':'disabled'}>Resume in terminal</button></div><small id="sessionNotice" role="status" aria-live="polite"></small></div></div><div class="drawer-scroll" id="sessionConversation"><section class="drawer-overview">${drawerOverview(t)}</section><section class="session-transcript" aria-label="Worker conversation"><div class="session-bar"><b>Conversation</b><small>${steps.length} / ${detail.total} entries${detail.truncated?' · Tail truncated':''}</small>${detail.previous_offset!=null?'<button class="btn" data-more-steps="1" id="drawerMore">Earlier entries</button>':''}${state.timelinePinned?'<span>History · live paused</span>':''}<button class="btn" data-refresh-timeline="1" id="drawerRefresh">Latest</button></div>${steps.map(transcriptMarkup).join('') || `<div class="empty">No session messages yet.</div><div class="message-text markdown">${markdown(t.brief || '')}</div>`}</section><section class="inspect" id="workerDiff" ${state.diff?'':'hidden'}>${state.diff?`<h4>${esc(state.diff.scope)}${state.diff.truncated?' · Truncated at 256 KiB':''}</h4><pre class="pre">${esc(state.diff.text || 'No committed changes.')}</pre>`:''}</section></div><div id="taskError" class="task-error" role="alert"></div><div class="modal-foot"><input id="taskInput" aria-label="Message this Worker" placeholder="Message ${esc(workerName(t))}"><button class="btn primary" id="taskSend" ${actionBusy?'disabled':''}>Send</button></div>`);
   $('taskInput').value=draftByTask.get(t.id) || $('taskInput').value;
@@ -2067,7 +2073,7 @@ async function loadDetail(more=false, metadata=false) {
     const offset=more ? detail.previous_offset : 0;
     const limit=more ? Math.min(100,detail.offset) : 100;
     const query=metadata && detail ? 'metadata=1' : `offset=${offset}&limit=${limit}` + (more?`&snapshot=${encodeURIComponent(detail.snapshot)}`:'&tail=1'+(detail?.snapshot?`&refresh=${encodeURIComponent(detail.snapshot)}`:''));
-    const result=await api(`tasks/${encodeURIComponent(id)}?${query}`);
+    const result=await api(`workers/${encodeURIComponent(id)}?by=id&${query}`);
     if(id!==state.task || generation!==detailGeneration) { releaseSnapshot(result.snapshot); return; }
     if(metadata && detail) detail.task=result.task;
     else {
@@ -2114,7 +2120,7 @@ async function taskAction(id, action, body={}) {
   actionBusy=true; let accepted=false;
   const questionId=action==='send' && find(id)?.status==='waiting'?find(id).question_id:null;
   try {
-    await api(`tasks/${encodeURIComponent(id)}/${action}`,body);
+    await api(`workers/${encodeURIComponent(id)}/${action}?by=id`,body);
     accepted=true; rememberAnswer(id,questionId);
     if(action==='send') { draftByTask.delete(id); if($('taskInput')) $('taskInput').value=''; const input=[...document.querySelectorAll('[data-reply-input]')].find(n=>n.dataset.replyInput===id); if(input) input.value=''; }
     error(''); await sync(); await loadDetail(false,state.timelinePinned);
@@ -2255,7 +2261,7 @@ document.addEventListener('click', async e => {
     else if(d.refreshTimeline) { state.timelinePinned=false; state.step=0; error(''); await loadDetail(); }
     else if(d.reply) { const input=[...document.querySelectorAll('[data-reply-input]')].find(n=>n.dataset.replyInput===d.reply); if(input?.value.trim()) await taskAction(d.reply,'send',{text:input.value,expected_status:'waiting'}); }
     else if(d.action && state.task) await taskAction(state.task,d.action,d.action==='model'?{profile:$('profileSelect').value}:{});
-    else if(d.diff && state.task) { const id=state.task; const diff=await api(`tasks/${encodeURIComponent(id)}/diff`); if(state.task===id) { state.diff=diff; const inspect=$('modalBox').querySelector('.inspect'); inspect.replaceChildren(); const title=document.createElement('h4'); title.textContent=diff.scope+(diff.truncated?' · Truncated at 256 KiB':''); const pre=document.createElement('pre'); pre.className='pre'; pre.textContent=diff.text || 'No committed changes.'; inspect.append(title,pre); inspect.hidden=false; inspect.scrollIntoView({block:'nearest'}); } }
+    else if(d.diff && state.task) { const id=state.task; const diff=await api(`workers/${encodeURIComponent(id)}/diff?by=id`); if(state.task===id) { state.diff=diff; const inspect=$('modalBox').querySelector('.inspect'); inspect.replaceChildren(); const title=document.createElement('h4'); title.textContent=diff.scope+(diff.truncated?' · Truncated at 256 KiB':''); const pre=document.createElement('pre'); pre.className='pre'; pre.textContent=diff.text || 'No committed changes.'; inspect.append(title,pre); inspect.hidden=false; inspect.scrollIntoView({block:'nearest'}); } }
     else if(el.id==='taskSend' && $('taskInput').value.trim()) { draftByTask.set(state.task,$('taskInput').value); await taskAction(state.task,'send',{text:$('taskInput').value,expected_status:detail.task.status}); }
   } catch(err) { error(err.message); }
 });
